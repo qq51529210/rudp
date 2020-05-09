@@ -1,84 +1,60 @@
 package rudp
 
 import (
-	"container/list"
 	"net"
 	"sync"
 	"time"
 )
 
-//type connState int
-//
-//const (
-//	connStateInvalid   connState = iota // 无效状态，即将移除
-//	connStateDialing                    // 客户端正在拔号连接，发送dial消息
-//	connStateAccepting                  // 服务端收到dial消息，建立连接，发送accept消息，等待客户端connect消息
-//	connStateRefused                    // 客户端收到refuse消息，连接被服务端拒绝
-//	connStateConnected                  // 客户端收到accept消息，或服务端收到connect消息，连接双向确认。
-//	connStateClosing                    // 应用层调用rut.conn.Close()函数，发送close消息，等待对方确认。
-//	connStateClosed                     // 收到对方的close消息，等待对方确认。
-//)
+type connState int
 
 const (
-	minReadBuffer  = 1024 * 4 // 最小读缓存，4k
-	minWriteBuffer = 1024 * 4 // 最小写缓存，4k
+	connStateClose   connState = iota // c<->s，连接超时/被应用层关闭，发送close消息
+	connStateDial                     // c->s，发送dial消息
+	connStateAccept                   // s->c，确认连接，发送accept消息
+	connStateConnect                  // c->s，发送connect消息，双向确认连接
 )
 
-type rBuf struct {
-	sync.RWMutex
-	data    list.List
-	buf     []byte
-	sn      uint32
-	minSN   uint32
-	maxSN   uint32
-	size    int
-	timeout time.Time
-	enable  chan struct{}
-	msgACK  // 消息缓存
-	message
-}
-
-type wBuf struct {
-	sync.RWMutex
-	data    list.List
-	sn      uint32
-	size    int
-	timeout time.Time
-	enable  chan struct{}
-}
-
 // 保存连接的基本信息，实现可靠性算法
-type conn struct {
-	sync.RWMutex               // 同步锁
-	rBuf                       // 读缓存
-	wBuf                       // 写缓存
-	lAddr        *net.UDPAddr  // 本地地址
-	rAddr        *net.UDPAddr  // 对端地址
-	cToken       uint32        // token
-	sToken       uint32        // token
-	rtt          time.Duration // 实时RTT，用于数据补发判断
-	rttVar       time.Duration // 平均RTT，用于计算RTO
+type Conn struct {
+	connState                    // 状态
+	sync.RWMutex                 // 同步锁
+	readBuffer                   // 读缓存
+	writeBuffer                  // 写缓存
+	rwBytes                      // 读写字节统计
+	connectSignal chan struct{}  // 作为确定连接的信号
+	closeSignal   chan struct{}  // 作为确定连接的信号
+	waitQuit      sync.WaitGroup // 等待所有协程退出
+	lAddr         *net.UDPAddr   // 本地地址
+	rAddr         *net.UDPAddr   // 对端地址
+	token         uint32         // 连接随机token，由server产生
+	mss           uint16         // 每一个消息大小，包括消息头
+	rto           time.Duration  // 超时重发
+	rtt           time.Duration  // 实时RTT，用于数据补发判断
+	rttVar        time.Duration  // 平均RTT，用于计算RTO
 }
 
-func (this *conn) SetReadBuffer(n int) error {
-	if n < minReadBuffer {
-		this.rCap = minReadBuffer
-	} else {
-		this.rCap = n
+func (this *Conn) SetReadBuffer(n int) error {
+	this.rBuf.Lock()
+	this.rBuf.length = n / int(this.mss)
+	if this.rBuf.length < 1 {
+		this.rBuf.length = 1
 	}
+	this.rBuf.Unlock()
 	return nil
 }
 
-func (this *conn) SetWriteBuffer(n int) error {
-	if n < minWriteBuffer {
-		this.wCap = minWriteBuffer
-	} else {
-		this.wCap = n
+func (this *Conn) SetWriteBuffer(n int) error {
+	this.wBuf.Lock()
+	this.wBuf.length = n / int(this.mss)
+	if this.wBuf.length < 1 {
+		this.wBuf.length = 1
 	}
+	this.wBuf.Unlock()
 	return nil
 }
 
-func (this *conn) Read(b []byte) (int, error) {
+func (this *Conn) Read(b []byte) (int, error) {
 	this.mutex.Lock()
 	// 是否设置了超时
 	if this.rto.IsZero() {
@@ -88,72 +64,43 @@ func (this *conn) Read(b []byte) (int, error) {
 	return 0, nil
 }
 
-func (this *conn) Write(b []byte) (int, error) {
+func (this *Conn) Write(b []byte) (int, error) {
 	return 0, nil
 }
 
-func (this *conn) Close() error {
+func (this *Conn) Close() error {
 	return nil
 }
 
-func (this *conn) LocalAddr() net.Addr {
+func (this *Conn) LocalAddr() net.Addr {
 	return this.lAddr
 }
 
-func (this *conn) RemoteAddr() net.Addr {
+func (this *Conn) RemoteAddr() net.Addr {
 	return this.rAddr
 }
 
-func (this *conn) SetDeadline(t time.Time) error {
+func (this *Conn) SetDeadline(t time.Time) error {
 	this.rto = t
 	this.wto = t
 	return nil
 }
 
-func (this *conn) SetReadDeadline(t time.Time) error {
+func (this *Conn) SetReadDeadline(t time.Time) error {
 	this.rto = t
 	return nil
 }
 
-func (this *conn) SetWriteDeadline(t time.Time) error {
+func (this *Conn) SetWriteDeadline(t time.Time) error {
 	this.wto = t
 	return nil
 }
 
-func (this *conn) read(b []byte) int {
+func (this *Conn) read(b []byte) int {
 	//this.rBuf.cond.L.Lock()
 	//this.rBuf.cond.L.Unlock()
 	return 0
 }
 
-// 添加
-func (this *conn) handleMsgData(conn *net.UDPConn, msg *message) error {
-	this.rBuf.Lock()
-	// 是否超过了接收缓存的最大序列号
-	if msg.sn >= this.rBuf.maxSN {
-		this.rBuf.Unlock()
-		return nil
-	}
-	// 小于已经接收的序列号，是重复的数据包
-	if msg.sn < this.rBuf.sn {
-		// 响应ack
-		this.writeAck(conn)
-		this.rBuf.Unlock()
-		return nil
-	}
-	this.rBuf.Unlock()
-	return nil
-}
-
-func (this *conn) writeAck(conn *net.UDPConn) error {
-	this.rBuf.msgACK.sn = this.rBuf.sn
-	this.rBuf.msgACK.maxSN = this.rBuf.maxSN
-	this.rBuf.msgACK.free = uint32(this.rBuf.size - this.rBuf.data.Len())
-	this.rBuf.message.EncACK(&this.rBuf.msgACK)
-	this.rBuf.message.Bytes()
-}
-
-// 添加
-func (this *conn) handleMsgACK(conn *net.UDPConn, msg *msgACK) error {
-	return nil
+func (this *Conn) checkWriteBuffer(conn *net.UDPConn, now time.Time) (int, error) {
 }

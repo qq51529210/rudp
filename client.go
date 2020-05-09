@@ -1,123 +1,163 @@
 package rudp
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-var (
-	// 发送dial消息的时间间隔
-	_dialDuration = time.Millisecond * 100
+const (
+	defaultDialRTO = time.Millisecond * 100 // 发送msgDial消息的时间间隔
 )
 
-// 设置发送dial消息的时间间隔
-func SetDialDuration(duration time.Duration) {
-	if duration > 0 {
-		_dialDuration = duration
-	}
-}
-
 type client struct {
-	sync.RWMutex                    // 锁
-	*net.UDPConn                    // socket
-	dialingConn   map[dialKey]*Conn // 正在创建连接的Conn
-	connectedConn map[uint32]*Conn  // 已经建立连接Conn
-	dialToken     uint32            // 用于建立连接的随机数，递增
-	valid         bool              // 是否
+	sync.RWMutex                  // 锁
+	dialing      map[uint32]*Conn // 正在创建连接的Conn
+	connected    map[uint32]*Conn // 已经建立连接Conn
+	token        uint32           // 用于建立连接的随机数，递增
+	dialRTO      time.Duration    // 发送msgDial消息的时间间隔
 }
 
-func newClient(conn *net.UDPConn) *client {
+func newClient() *client {
 	p := new(client)
-	p.UDPConn = conn
-	p.dialingConn = make(map[dialKey]*Conn)
-	p.connectedConn = make(map[uint32]*Conn)
+	p.dialing = make(map[uint32]*Conn)
+	p.connected = make(map[uint32]*Conn)
+	p.token = _rand.Uint32()
+	p.dialRTO = defaultDialRTO
 	return p
 }
 
-// 连接指定的地址，返回
-func (this *client) Dial(addr string, timeout time.Duration) (*Conn, error) {
-	//conn, err := this.newDialConn(addr)
-	//if err != nil {
-	//	return nil, err
-	//}
-	//// 初始化消息
-	//msg := new(message)
-	//msg.EncDial()
-	//// 开始时间
-	//start_time := time.Now()
-	//ticker := time.NewTicker(_dialDuration)
-	//for {
-	//	select {
-	//	case now := <-ticker.C: // 到时间发送dial消息
-	//		if now.Sub(start_time) >= timeout {
-	//			// 超时
-	//			this.removeDialConn(conn)
-	//			return nil, this.opError("dial", conn.rAddr, errorTimeout)
-	//		}
-	//		// 检查Conn的状态
-	//		switch conn.getState() {
-	//		case connStateDialing: // 还未建立连接，继续发送消息
-	//			_, err = this.conn.WriteToUDP(msg.Bytes(), conn.rAddr.(*net.UDPAddr))
-	//			if err != nil {
-	//				this.removeDialConn(conn)
-	//				return nil, err
-	//			}
-	//		case connStateConnected: // 已经建立连接
-	//			return conn, nil
-	//		case connStateRefused: // 服务端拒绝连接
-	//			this.removeDialConn(conn)
-	//			return nil, this.opError("dial", conn.rAddr, errorDialRefused)
-	//		default: // 其他状态
-	//			this.removeDialConn(conn)
-	//			return nil, this.opError("dial", conn.rAddr, errorClosed)
-	//		}
-	//	case <-this.quit: // 被关闭了
-	//		this.removeDialConn(conn)
-	//		return nil, this.opError("dial", conn.rAddr, errorClosed)
-	//	}
-	//}
-	return nil, nil
+// 设置msgDial的超时重发
+func (this *RUDP) SetDialRTO(rto time.Duration) {
+	if rto > 0 {
+		this.client.dialRTO = rto
+	}
 }
 
-// 创建一个新的Conn，添加到dialing列表中
-func (this *client) newDialConn(addr string) (*Conn, error) {
-	// 解析地址
-	rAddr, err := net.ResolveUDPAddr("udp", addr)
+// 连接指定的地址，返回
+func (this *RUDP) Dial(addr string, timeout time.Duration) (*Conn, error) {
+	conn, token, err := this.newDialConn(addr)
 	if err != nil {
 		return nil, err
 	}
-	// 初始化Conn
-	conn := newConn()
-	conn.rAddr = rAddr
-	conn.lAddr = this.LocalAddr()
-	conn.state = connStateDialing
-	// 当前随机数+1
-	conn.cToken = atomic.AddUint32(&this.dialToken, 1)
-	// 加入列表
-	//token := conn.cToken
-	//this.Lock()
-	//for this.valid {
-	//	// 是否存在
-	//	_, ok := this.dialingConn[conn.cToken]
-	//	if ok {
-	//		conn.cToken = atomic.AddUint32(&this.client.dialToken, 1)
-	//		// 循环了uint32一圈，列表满了
-	//		if conn.cToken == token {
-	//			return nil, this.opError("dial", rAddr, errorTooManyConn)
-	//		}
-	//	}
-	//	this.client.dialConn[conn.cToken] = conn
-	//	break
-	//}
-	//this.client.Unlock()
-	return conn, nil
+	// 初始化msgDial
+	var msg message
+	this.encodeMsgDial(conn, &msg)
+	// 开始时间
+	start_time := time.Now()
+	// 发送msgDial的时间间隔
+	ticker := time.NewTicker(this.client.dialRTO)
+	// 循环
+Loop:
+	for {
+		select {
+		case now := <-ticker.C:
+			// 发送msgDial间隔
+			if now.Sub(start_time) >= timeout {
+				// 超时
+				err = this.opError("dial", conn.rAddr, errOP("timeout"))
+				break Loop
+			}
+			// 发送
+			_, err = this.conn.WriteToUDP(msg.b[:msgDialLength], conn.rAddr)
+			if err != nil {
+				break Loop
+			}
+		case <-conn.connectSignal:
+			// 有结果通知
+			conn.RLock()
+			state := conn.connState
+			conn.RUnlock()
+			// 检查状态
+			switch state {
+			case connStateConnect:
+				// 已经建立连接
+				ticker.Stop()
+				// 添加到client.connected
+				this.client.Lock()
+				this.client.connected[conn.token] = conn
+				this.client.Unlock()
+				// 返回
+				return conn, nil
+			case connStateClose:
+				// 服务端拒绝连接
+				err = this.opError("dial", conn.rAddr, errOP("refuse"))
+			default:
+				// 其他状态都是逻辑bug
+				err = this.opError("dial", conn.rAddr, errOP("bug"))
+			}
+			break Loop
+		case <-this.closeSignal:
+			// rudp被关闭
+			err = this.opError("dial", conn.rAddr, errClosed)
+			break Loop
+		}
+	}
+	// 出错
+	ticker.Stop()
+	close(conn.connectSignal)
+	// 移除列表
+	this.client.Lock()
+	delete(this.client.dialing, token)
+	this.client.Unlock()
+	// 返回
+	return nil, err
 }
 
-// 移除指定的Conn
-func (this *client) removeDialConn(conn *Conn) {
-	//this.Lock()
-	//delete(this.dialConn, conn.cToken)
-	//this.Unlock()
+// 创建一个新的客户端Conn，拆分Dial()代码
+func (this *RUDP) newDialConn(addr string) (*Conn, uint32, error) {
+	// 解析地址
+	rAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, 0, err
+	}
+	// 初始化Conn
+	conn := this.newConn(connStateDial, rAddr)
+	// 探测mss
+	conn.mss = DetectMSS(rAddr)
+	// 产生客户端token
+	this.client.Lock()
+	token := this.client.token
+	this.client.token++
+	tkn := token
+	ok := true
+	for {
+		_, ok = this.client.dialing[token]
+		if !ok {
+			break
+		}
+		token = this.client.token
+		this.client.token++
+		// 连接耗尽，2^32，理论上现有计算机不可能
+		if conn.token == tkn {
+			this.client.Unlock()
+			return nil, 0, this.opError("dial", rAddr, errOP("too many connections"))
+		}
+	}
+	// 添加到列表
+	this.client.dialing[token] = conn
+	this.client.Unlock()
+	return conn, token, nil
+}
+
+// 编码msgDial，拆分Dial()代码
+func (this *RUDP) encodeMsgDial(conn *Conn, msg *message) {
+	msg.b[msgType] = msgDial
+	binary.BigEndian.PutUint32(msg.b[msgDialVersion:], msgVersion)
+	copy(msg.b[msgDialLocalIP:], conn.lAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.b[msgDialLocalPort:], uint16(conn.lAddr.Port))
+	binary.BigEndian.PutUint16(msg.b[msgDialMSS:], conn.mss)
+	binary.BigEndian.PutUint32(msg.b[msgDialReadBuffer:], uint32(conn.rBuf.length))
+	binary.BigEndian.PutUint32(msg.b[msgDialWriteBuffer:], uint32(conn.wBuf.length))
+}
+
+// 释放client相关的资源
+func (this *RUDP) closeClient() {
+	for _, c := range this.client.dialing {
+		c.Close()
+	}
+	for _, c := range this.client.connected {
+		c.Close()
+	}
 }
