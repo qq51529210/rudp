@@ -15,57 +15,119 @@ const (
 	connStateConnect                  // c->s，发送connect消息，双向确认连接
 )
 
+// 创建一个新的Conn变量
+func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr) *Conn {
+	conn := new(Conn)
+	conn.connState = state
+	conn.rAddr = rAddr
+	conn.lAddr = this.conn.LocalAddr().(*net.UDPAddr)
+	//conn.readBuffer.Cond = sync.NewCond(&conn.readBuffer.RWMutex)
+	conn.readBuffer.enable = make(chan int)
+	conn.SetReadBuffer(this.connReadBuffer)
+	//conn.writeBuffer.Cond = sync.NewCond(&conn.writeBuffer.RWMutex)
+	conn.writeBuffer.enable = make(chan int)
+	conn.SetWriteBuffer(this.connWriteBuffer)
+	conn.connectSignal = make(chan struct{})
+	conn.closeSignal = make(chan struct{})
+	return conn
+}
+
 // 保存连接的基本信息，实现可靠性算法
 type Conn struct {
 	connState                    // 状态
-	sync.RWMutex                 // 同步锁
-	readBuffer                   // 读缓存
-	writeBuffer                  // 写缓存
-	rwBytes                      // 读写字节统计
+	*readBuffer                  // 读缓存
+	*writeBuffer                 // 写缓存
+	dataBytes     ioBytes        // 有效数据总字节
+	totalBytes    ioBytes        // 读写总字节
 	connectSignal chan struct{}  // 作为确定连接的信号
 	closeSignal   chan struct{}  // 作为确定连接的信号
 	waitQuit      sync.WaitGroup // 等待所有协程退出
 	lAddr         *net.UDPAddr   // 本地地址
 	rAddr         *net.UDPAddr   // 对端地址
-	token         uint32         // 连接随机token，由server产生
-	mss           uint16         // 每一个消息大小，包括消息头
-	rto           time.Duration  // 超时重发
-	rtt           time.Duration  // 实时RTT，用于数据补发判断
-	rttVar        time.Duration  // 平均RTT，用于计算RTO
+	cToken        uint32         // client连接随机token
+	sToken        uint32         // server连接随机token
+}
+
+// 返回net.OpError
+func (this *Conn) netOpError(op string, err error) error {
+	return &net.OpError{
+		Op:     op,
+		Net:    "udp",
+		Source: this.rAddr,
+		Addr:   this.lAddr,
+		Err:    err,
+	}
 }
 
 func (this *Conn) SetReadBuffer(n int) error {
-	this.rBuf.Lock()
-	this.rBuf.length = n / int(this.mss)
-	if this.rBuf.length < 1 {
-		this.rBuf.length = 1
-	}
-	this.rBuf.Unlock()
+	this.readBuffer.Lock()
+	this.readBuffer.max = maxInt(1, n/int(this.mss))
+	this.readBuffer.Unlock()
 	return nil
 }
 
 func (this *Conn) SetWriteBuffer(n int) error {
-	this.wBuf.Lock()
-	this.wBuf.length = n / int(this.mss)
-	if this.wBuf.length < 1 {
-		this.wBuf.length = 1
-	}
-	this.wBuf.Unlock()
+	this.writeBuffer.Lock()
+	this.writeBuffer.max = maxInt(1, n/int(this.mss))
+	this.writeBuffer.Unlock()
 	return nil
 }
 
 func (this *Conn) Read(b []byte) (int, error) {
-	this.mutex.Lock()
-	// 是否设置了超时
-	if this.rto.IsZero() {
-		//this.rBuf.cond.L.Lock()
+	this.readBuffer.RLock()
+	timeout := this.readBuffer.timeout
+	this.readBuffer.RUnlock()
+	if timeout.IsZero() {
+		select {
+		case <-this.readBuffer.enable:
+			return this.readBuffer.read(b), nil
+		case <-this.connectSignal:
+			return 0, this.netError("read", errClosed("conn"))
+		}
 	}
-	this.mutex.Unlock()
-	return 0, nil
+	duration := timeout.Sub(time.Now())
+	if duration <= 0 {
+		return 0, this.netError("read", errOP("timeout"))
+	}
+	select {
+	case <-this.readBuffer.enable:
+		return this.readBuffer.read(b), nil
+	case <-this.connectSignal:
+		return 0, this.netError("read", errClosed("conn"))
+	case <-time.After(duration):
+		return 0, this.netError("read", errOP("timeout"))
+	}
 }
 
 func (this *Conn) Write(b []byte) (int, error) {
-	return 0, nil
+	this.writeBuffer.RLock()
+	timeout := this.writeBuffer.timeout
+	this.writeBuffer.RUnlock()
+	if timeout.IsZero() {
+		select {
+		case <-this.writeBuffer.enable:
+			return this.write(b), nil
+		case <-this.connectSignal:
+			return 0, this.netError("read", errClosed("conn"))
+		}
+	}
+	duration := timeout.Sub(time.Now())
+	if duration <= 0 {
+		return 0, this.netError("read", errOP("timeout"))
+	}
+	select {
+	case <-this.writeBuffer.enable:
+		return this.write(b), nil
+	case <-this.connectSignal:
+		return 0, this.netError("read", errClosed("conn"))
+	case <-time.After(duration):
+		return 0, this.netError("write", errOP("timeout"))
+	}
+}
+
+func (this *Conn) write(b []byte) int {
+	this.writeBuffer.Lock()
+	this.writeBuffer.Unlock()
 }
 
 func (this *Conn) Close() error {
@@ -96,11 +158,5 @@ func (this *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (this *Conn) read(b []byte) int {
-	//this.rBuf.cond.L.Lock()
-	//this.rBuf.cond.L.Unlock()
-	return 0
-}
-
-func (this *Conn) checkWriteBuffer(conn *net.UDPConn, now time.Time) (int, error) {
+func (this *Conn) checkWriteBuffer(conn *net.UDPConn, now time.Time) error {
 }
