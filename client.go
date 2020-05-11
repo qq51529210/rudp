@@ -63,13 +63,7 @@ Loop:
 		case <-conn.connectSignal:
 			switch conn.state {
 			case connStateConnect:
-				// 已经建立连接，添加到已连接列表
-				this.client.Lock()
-				this.client.connected[conn.sToken] = conn
-				this.client.Unlock()
-				// 启动客户端Conn写协程
-				go this.connWriteRoutine(conn)
-				// 返回
+				// 已经建立连接
 				return conn, nil
 			case connStateClose:
 				// 服务端拒绝连接
@@ -103,7 +97,7 @@ func (this *RUDP) dialConn(addr string) (*Conn, error) {
 		return nil, err
 	}
 	// 探测mss，并初始化Conn
-	conn := this.newConn(connStateDial, rAddr, DetectMSS(rAddr))
+	conn := this.newConn(connStateDial, rAddr, DetectMSS(rAddr), csC)
 	// 产生客户端token
 	this.client.Lock()
 	conn.cToken = this.client.token
@@ -131,11 +125,12 @@ func (this *RUDP) dialConn(addr string) (*Conn, error) {
 
 // 客户端Conn写协程
 func (this *RUDP) connWriteRoutine(conn *Conn) {
-	conn.wait.Add(1)
+	this.wait.Add(1)
 	timer := time.NewTimer(conn.wBuf.rto)
 	defer func() {
 		timer.Stop()
-		conn.wait.Done()
+		this.closeConn(conn)
+		this.wait.Done()
 	}()
 	select {
 	case now := <-timer.C:

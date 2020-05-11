@@ -2,7 +2,6 @@ package rudp
 
 import (
 	"encoding/binary"
-	"github.com/qq51529210/log"
 	"sync"
 	"time"
 )
@@ -15,21 +14,26 @@ import (
 // 双向连接时，假设，a-token1==b-token2 && b-token1==a-token2
 // 这样的情况，如果不区分c/s消息，单靠一个token无法定位到Conn1/Conn2
 const (
-	msgExtend  = iota // 可扩展的消息
-	msgDial           // c->s，请求创建连接，握手1
-	msgAccept         // s->c，接受连接，握手2
-	msgRefuse         // s->c，拒绝连接，握手2
-	msgConnect        // c->s，收到接受连接的消息，握手3
-	msgDataC          // c->s，数据
-	msgDataS          // s->c，数据
-	msgAckC           // c->s，收到数据确认
-	msgAckS           // s->c，收到数据确认
-	msgCloseC         // c->s，关闭
-	msgCloseS         // s->c，关闭
-	msgPing           // c->s
-	msgPong           // s->c
-	msgInvalid        // s<->c，无效的连接
+	msgExtend   = iota // 可扩展的消息
+	msgDial            // c->s，请求创建连接，握手1
+	msgAccept          // s->c，接受连接，握手2
+	msgRefuse          // s->c，拒绝连接，握手2
+	msgConnect         // c->s，收到接受连接的消息，握手3
+	msgDataC           // c->s，数据
+	msgDataS           // s->c，数据
+	msgAckC            // c->s，收到数据确认
+	msgAckS            // s->c，收到数据确认
+	msgCloseC          // c->s，关闭
+	msgCloseS          // s->c，关闭
+	msgPing            // c->s
+	msgPong            // s->c
+	msgInvalidC        // c->s
+	msgInvalidS        // s->c
 )
+
+var msgData = []byte{msgDataC, msgDataS}
+var msgAck = []byte{msgAckC, msgAckS}
+var msgClose = []byte{msgCloseC, msgCloseS}
 
 const (
 	ipV4Header = 20                              // IPv4数据包头大小
@@ -64,26 +68,26 @@ const (
 	msgDialReadBuffer  = msgDialLocalPort + 2   // 客户端的接收缓存队列长度，窗口控制初始参考值
 	msgDialWriteBuffer = msgDialReadBuffer + 4  // 客户端的发送缓存队列长度，窗口控制初始参考值
 	msgDialTimeout     = msgDialWriteBuffer + 4 // 客户端的超时
-	msgDialLength      = msgDialTimeout + 8     // 数据大小
+	msgDialLength      = msgDialTimeout + 8     // 消息大小
 )
 
 func (this *RUDP) handleMsgDial(msg *udpData) {
+	// 没有开启服务
+	if this.server.accepted == nil {
+		return
+	}
 	// 检查消息大小和版本
 	if msg.n != msgDialLength || msg.b[msgDialVersion] != msgVersion {
 		return
 	}
 	token := binary.BigEndian.Uint32(msg.b[msgDialToken:])
-	// 获取Conn
+	// accepting Conn
 	var key dialKey
 	key.Init(msg.a, token)
 	this.server.Lock()
 	conn, ok := this.server.accepting[key]
 	// 存在，这里不处理
 	if ok {
-		// connStateAccepting: 发送accept消息的协程在处理
-		// connStateConnected: 已经连接，说明是重复的过期的消息
-		// connStateRefused: 服务端不可能，逻辑bug
-		// connStateClose: 正在关闭，说明是重复的过期的消息
 		this.server.Unlock()
 		return
 	}
@@ -99,7 +103,7 @@ func (this *RUDP) handleMsgDial(msg *udpData) {
 		// 返回
 		return
 	}
-	// 添加到列表
+	// 添加到accepting，connected列表
 	this.server.accepting[key] = conn
 	this.server.connected[conn.sToken] = conn
 	this.server.Unlock()
@@ -116,7 +120,7 @@ const (
 	msgAcceptClientPort  = msgAcceptClientIP + 16   // 客户端的公网ip
 	msgAcceptReadBuffer  = msgAcceptClientPort + 2  // 服务端的接收缓存队列长度，窗口控制初始参考值
 	msgAcceptWriteBuffer = msgAcceptReadBuffer + 4  // 服务端的发送缓存队列长度，窗口控制初始参考值
-	msgAcceptLength      = msgAcceptWriteBuffer + 4 // 数据大小
+	msgAcceptLength      = msgAcceptWriteBuffer + 4 // 消息大小
 )
 
 func (this *RUDP) handleMsgAccept(msg *udpData) {
@@ -126,13 +130,14 @@ func (this *RUDP) handleMsgAccept(msg *udpData) {
 	}
 	cToken := binary.BigEndian.Uint32(msg.b[msgAcceptCToken:])
 	sToken := binary.BigEndian.Uint32(msg.b[msgAcceptSToken:])
-	// 获取conn
+	// dialing Conn
 	this.client.RLock()
 	conn, ok := this.client.dialing[cToken]
 	this.client.RUnlock()
 	// 不存在
 	if !ok {
 		// 发送invalid消息，通知对方
+		this.writeMsgInvalid(msg, msgInvalidC, sToken)
 		return
 	}
 	// 检查状态
@@ -142,26 +147,33 @@ func (this *RUDP) handleMsgAccept(msg *udpData) {
 		conn.sToken = sToken
 		conn.state = connStateConnect
 		conn.lock.Unlock()
-		// 通知
+		// 添加到已连接列表
+		this.client.Lock()
+		this.client.connected[conn.sToken] = conn
+		this.client.Unlock()
+		// 启动客户端Conn写协程
+		go this.connWriteRoutine(conn)
+		// 通知连接
 		close(conn.connectSignal)
-		// 发送msgConnect
-		this.writeMsgConnect(msg, sToken)
+		// 发送connect消息
+		conn.connectMsg(msg)
+		this.writeToConn(msg, conn)
 	case connStateConnect:
-		// 重复收到msgAccept
 		conn.lock.Unlock()
-		// 发送msgConnect
-		this.writeMsgConnect(msg, sToken)
+		// 发送connect消息
+		conn.connectMsg(msg)
+		this.writeToConn(msg, conn)
 	default:
-		// 其他不处理
+		// 其他状态不处理
 		conn.lock.Unlock()
 	}
 }
 
 // msgRefuse
 const (
-	msgRefuseToken   = 1                    // 客户端发过来的token
-	msgRefuseVersion = msgRefuseToken + 4   // 服务端版本号
-	msgRefuseLength  = msgRefuseVersion + 4 // 数据大小
+	msgRefuseVersion = 1                    // 服务端版本号
+	msgRefuseToken   = msgRefuseVersion + 4 // 客户端发过来的token
+	msgRefuseLength  = msgRefuseToken + 4   // 消息大小
 )
 
 func (this *RUDP) handleMsgRefuse(msg *udpData) {
@@ -169,58 +181,72 @@ func (this *RUDP) handleMsgRefuse(msg *udpData) {
 	if msg.n != msgRefuseLength || msg.b[msgRefuseVersion] != msgVersion {
 		return
 	}
-	// 检查token是否存在client.dialing
 	token := binary.BigEndian.Uint32(msg.b[msgRefuseToken:])
+	// dialing Conn
 	this.client.RLock()
 	conn, ok := this.client.dialing[token]
 	this.client.RUnlock()
-	// 存在，并且仍然是connStateDial
-	if ok {
-		conn.Lock()
-		if conn.connState == connStateDial {
-			conn.connState = connStateClose
-			close(conn.connectSignal)
-		}
-		conn.Unlock()
+	// 不存在不处理
+	if !ok {
+		return
+	}
+	// 检查状态
+	conn.lock.Lock()
+	switch conn.state {
+	case connStateDial:
+		// 关闭
+		conn.state = connStateClose
+		conn.lock.Unlock()
+		// 通知
+		close(conn.connectSignal)
+	default:
+		// 其他状态不处理
+		// connStateAccept: 客户端不可能
+		// connStateClose: 正在关闭
+		// connStateConnect: 已经连接
+		conn.lock.Unlock()
 	}
 }
 
 // msgConnect
 const (
-	msgConnectToken  = 1                   // 连接会话token
-	msgConnectLength = msgConnectToken + 4 // 数据大小
+	msgConnectToken  = 1                   // 连接token
+	msgConnectLength = msgConnectToken + 4 // 消息大小
 )
 
 func (this *RUDP) handleMsgConnect(msg *udpData) {
-	// 检查消息大小和版本
+	// 没有开启服务
+	if this.server.accepted == nil {
+		return
+	}
+	// 检查消息大小
 	if msg.n != msgConnectLength {
 		return
 	}
-	// 检查token是否存在client.dialing
 	token := binary.BigEndian.Uint32(msg.b[msgConnectToken:])
+	// connected Conn
 	this.server.RLock()
 	conn, ok := this.server.connected[token]
 	this.server.RUnlock()
+	// 不存在
 	if !ok {
-		conn.Lock()
-		switch conn.connState {
-		case connStateAccept:
-			// 第一次收到msgConnect
-			conn.connState = connStateConnect
-			conn.Unlock()
-			// 通知
-			close(conn.connectSignal)
-		case connStateConnect:
-			// 重复消息，不处理
-			conn.Unlock()
-		case connStateDial:
-			// 服务端不可能有这个状态
-			conn.Unlock()
-			log.Print(this.logger, log.LevelError, 0, log.FileLineFullPath, "server connect bug")
-		default:
-			// 其他不处理
-			conn.Unlock()
-		}
+		return
+	}
+	// 检查状态
+	conn.lock.Lock()
+	switch conn.state {
+	case connStateAccept:
+		// 第一次收到msgConnect
+		conn.state = connStateConnect
+		conn.lock.Unlock()
+		// 通知
+		close(conn.connectSignal)
+	default:
+		// 其他不处理
+		// connStateConnect，重复消息
+		// connStateDial，服务端不可能
+		// connStateClose，关闭了
+		conn.lock.Unlock()
 	}
 }
 
@@ -232,72 +258,41 @@ const (
 )
 
 func (this *RUDP) handleMsgDataC(msg *udpData) {
-	// token
+	// 没有开启服务
+	if this.server.accepted == nil {
+		return
+	}
 	token := binary.BigEndian.Uint32(msg.b[msgDataToken:])
+	// server connected Conn
 	this.server.RLock()
 	conn, ok := this.server.connected[token]
 	this.server.RUnlock()
+	// 不存在
 	if !ok {
-		// 没有
-		this.writeMsgInvalid(msg, token)
-		_dataPool.Put(msg)
+		this.writeMsgInvalid(msg, msgInvalidS, token)
 		return
 	}
-	this.handleMsgData(conn, msg, csServer)
+	// 添加数据
+	if conn.rBuf.Add(msg, conn.cs) {
+		this.writeToConn(msg, conn)
+	}
 }
 
 func (this *RUDP) handleMsgDataS(msg *udpData) {
-	// token
 	token := binary.BigEndian.Uint32(msg.b[msgDataToken:])
+	// client connected Conn
 	this.client.RLock()
 	conn, ok := this.client.connected[token]
 	this.client.RUnlock()
+	// 不存在
 	if !ok {
-		// 没有
-		this.writeMsgInvalid(msg, token)
-		_dataPool.Put(msg)
+		this.writeMsgInvalid(msg, msgInvalidC, token)
 		return
 	}
-	this.handleMsgData(conn, msg, csClient)
-}
-
-func (this *RUDP) handleMsgData(conn *Conn, msg *udpData, cs cs) {
-	sn := binary.BigEndian.Uint32(msg.b[msgDataSN:])
-	rb := conn.readBuffer
-	// 检查sn是否在接收缓存范围
-	rb.lock.Lock()
-	// 超过了接收缓存的最大序列号
-	if sn >= rb.maxSN {
-		rb.lock.Unlock()
-		return
+	// 添加数据
+	if conn.rBuf.Add(msg, conn.cs) {
+		this.writeToConn(msg, conn)
 	}
-	// 是新的数据
-	if sn >= rb.nextSN {
-		conn.readBuffer.Add(sn, msg.b[msgDataPayload:msg.n])
-	}
-	// 可读
-	if sn == rb.nextSN {
-		rb.nextSN++
-		rb.ackId = 0
-		select {
-		case rb.enable <- 1:
-		default:
-		}
-	}
-	// 剩余的容量
-	left := rb.Left()
-	ack := rb.ackId
-	rb.ackId++
-	rb.lock.Unlock()
-	// 响应ack
-	msg.b[msgType] = msgAck[cs]
-	binary.BigEndian.PutUint32(msg.b[msgAckToken:], conn.sToken)
-	binary.BigEndian.PutUint32(msg.b[msgAckSN:], sn)
-	binary.BigEndian.PutUint32(msg.b[msgAckBuffer:], left)
-	binary.BigEndian.PutUint64(msg.b[msgAckId:], ack)
-	// 这里不处理错误
-	this.WriteTo(msg.b[:msgAckLength], msg.a)
-	conn.totalBytes.w += uint64(msgAckLength)
 }
 
 // msgAck
@@ -311,6 +306,13 @@ const (
 )
 
 func (this *RUDP) handleMsgAckC(msg *udpData) {
+	// 没有开启服务
+	if this.server.accepted == nil {
+		return
+	}
+	if msg.n != msgAckLength {
+		return
+	}
 	this.client.RLock()
 	conn, ok := this.client.connected[binary.BigEndian.Uint32(msg.b[msgAckToken:])]
 	this.client.RUnlock()
@@ -318,82 +320,21 @@ func (this *RUDP) handleMsgAckC(msg *udpData) {
 		_dataPool.Put(msg)
 		return
 	}
-	this.handleMsgAck(conn, msg)
+	conn.wBuf.Remove(msg)
 }
 
 func (this *RUDP) handleMsgAckS(msg *udpData) {
-	this.client.RLock()
-	conn, ok := this.client.connected[binary.BigEndian.Uint32(msg.b[msgAckToken:])]
-	this.client.RUnlock()
+	if msg.n != msgAckLength {
+		return
+	}
+	this.server.RLock()
+	conn, ok := this.server.connected[binary.BigEndian.Uint32(msg.b[msgAckToken:])]
+	this.server.RUnlock()
 	if !ok {
 		_dataPool.Put(msg)
 		return
 	}
-	this.handleMsgAck(conn, msg)
-}
-
-func (this *RUDP) handleMsgAck(conn *Conn, msg *udpData) {
-	// 检查发送队列
-	conn.writeBuffer.Lock()
-	if conn.writeBuffer.data == nil {
-		conn.writeBuffer.Unlock()
-		return
-	}
-	sn := binary.BigEndian.Uint32(msg.b[msgAckSN:])
-	max_sn := binary.BigEndian.Uint32(msg.b[msgAckMaxSN:])
-	p := conn.writeBuffer.data
-	ok := false
-	if max_sn >= sn {
-		// 从发送队列移除小于max_sn的数据块
-		for p != nil {
-			if p.sn > sn {
-				break
-			}
-			if p.sn == sn {
-				// 计算RTO
-				conn.writeBuffer.CalcRTO(p)
-			}
-			// 移除
-			n := p.next
-			conn.writeBuffer.putData(p)
-			p = n
-		}
-		conn.writeBuffer.data = p
-		conn.writeBuffer.UpdateAck(max_sn, msg)
-		ok = true
-	} else {
-		// 从发送队列移除指定sn的数据块
-		if p.sn == sn {
-			// 链表头
-			conn.writeBuffer.data = p.next
-			conn.writeBuffer.UpdateAck(sn, msg)
-			conn.writeBuffer.putData(p)
-			ok = true
-		} else {
-			next := p.next
-			for next != nil {
-				if next.sn > sn {
-					break
-				}
-				if next.sn == sn {
-					// 计算RTO
-					conn.writeBuffer.CalcRTO(next)
-					// 移除
-					p.next = next.next
-					conn.writeBuffer.putData(next)
-					conn.writeBuffer.UpdateAck(sn, msg)
-					ok = true
-					break
-				}
-				next = p.next
-			}
-		}
-	}
-	conn.writeBuffer.Unlock()
-	// 是否可写入新数据
-	if ok {
-		conn.writeBuffer.Signal()
-	}
+	conn.wBuf.Remove(msg)
 }
 
 // msgClose
@@ -403,75 +344,136 @@ const (
 )
 
 func (this *RUDP) handleMsgCloseC(msg *udpData) {
-	token := binary.BigEndian.Uint32(msg.b[msgCloseToken:])
-	this.client.RLock()
-	conn, ok := this.server.connected[token]
-	if ok {
-		var key dialKey
-		key.Init(conn.rAddr, conn.cToken)
-		delete(this.server.accepting, key)
-		delete(this.server.connected, token)
-		conn.Close()
+	// 没有开启服务
+	if this.server.accepted == nil {
+		return
 	}
-	this.server.Unlock()
-	this.writeMsgClose(msg, token, csServer)
+	if msg.n != msgCloseLength {
+		return
+	}
+	token := binary.BigEndian.Uint32(msg.b[msgCloseToken:])
+	this.server.RLock()
+	conn, ok := this.server.connected[token]
+	this.server.RUnlock()
+	if ok {
+		conn.Close()
+		conn.closeMsg(msg)
+		this.writeToConn(msg, conn)
+	} else {
+		this.writeMsgInvalid(msg, msgInvalidS, token)
+	}
 }
 
 func (this *RUDP) handleMsgCloseS(msg *udpData) {
-	token := binary.BigEndian.Uint32(msg.b[msgCloseToken:])
-	this.client.Lock()
-	conn, ok := this.client.connected[token]
-	if ok {
-		delete(this.client.dialing, conn.cToken)
-		delete(this.client.connected, token)
-		conn.Close()
+	if msg.n != msgCloseLength {
+		return
 	}
-	this.client.Unlock()
-	this.writeMsgClose(msg, token, csClient)
+	token := binary.BigEndian.Uint32(msg.b[msgCloseToken:])
+	this.client.RLock()
+	conn, ok := this.client.connected[token]
+	this.client.RUnlock()
+	if ok {
+		conn.Close()
+		conn.closeMsg(msg)
+		this.writeToConn(msg, conn)
+	} else {
+		this.writeMsgInvalid(msg, msgInvalidC, token)
+	}
 }
 
-// msgPingPong
+// msgPing
 const (
-	msgPingPongToken  = 1
-	msgPingPongBuffer = msgPingPongToken + 4  // 剩余的接受缓存容量长度
-	msgPingPongLength = msgPingPongBuffer + 4 // 数据大小
+	msgPingToken  = 1
+	msgPingId     = msgPingToken + 4
+	msgPingLength = msgPingId + 4 // 数据大小
 )
 
-// 处理消息msgPing
+// 处理Ping消息
 func (this *RUDP) handleMsgPing(msg *udpData) {
-
+	if msg.n != msgPingLength {
+		return
+	}
+	token := binary.BigEndian.Uint32(msg.b[msgPingToken:])
+	this.server.RLock()
+	conn, ok := this.server.connected[token]
+	this.server.RUnlock()
+	if !ok {
+		return
+	}
+	conn.pongMsg(msg, binary.BigEndian.Uint32(msg.b[msgPingId:]))
+	this.writeToConn(msg, conn)
 }
 
-// 处理消息msgPong
+// msgPong
+const (
+	msgPongToken  = 1
+	msgPongId     = msgPongToken + 4  // ping传过来的id
+	msgPongSN     = msgPongId + 4     // 当前的sn
+	msgPongBuffer = msgPongSN + 4     // 剩余的接受缓存容量长度
+	msgPongLength = msgPongBuffer + 4 // 数据大小
+)
+
+// 处理Pong消息
 func (this *RUDP) handleMsgPong(msg *udpData) {
-
-}
-
-// 发送消息msgConnect
-func (this *RUDP) writeMsgConnect(msg *udpData, token uint32) {
-	binary.BigEndian.PutUint32(msg.b[msgConnectToken:], token)
-	this.conn.WriteToUDP(msg.b[:msgConnectLength], msg.a)
-}
-
-// 发送消息msgClose
-func (this *RUDP) writeMsgClose(msg *udpData, token uint32, cs cs) {
-	msg.b[msgType] = msgClose[cs]
-	binary.BigEndian.PutUint32(msg.b[msgCloseToken:], token)
-	this.conn.WriteToUDP(msg.b[:msgCloseLength], msg.a)
+	if msg.n != msgPongLength {
+		return
+	}
+	token := binary.BigEndian.Uint32(msg.b[msgPongToken:])
+	this.client.RLock()
+	conn, ok := this.client.connected[token]
+	this.client.RUnlock()
+	if !ok {
+		return
+	}
+	id := binary.BigEndian.Uint32(msg.b[msgPongSN:])
+	conn.lock.Lock()
+	if id != conn.pingId {
+		conn.lock.Unlock()
+		return
+	}
+	conn.pingId++
+	left := binary.BigEndian.Uint32(msg.b[msgPongBuffer:])
+	conn.wBuf.canWrite = left
+	conn.lock.Unlock()
 }
 
 // msgInvalid
 const (
 	msgInvalidToken  = 1
-	msgInvalidLength = msgInvalidToken + 4
+	msgInvalidLength = msgInvalidToken + 4 // 数据大小
 )
 
-func (this *RUDP) handleMsgInvalid(msg *udpData) {
-
+// 处理invalid消息
+func (this *RUDP) handleMsgInvalidC(msg *udpData) {
+	if msg.n != msgInvalidLength {
+		return
+	}
+	token := binary.BigEndian.Uint32(msg.b[msgInvalidToken:])
+	this.server.RLock()
+	conn, ok := this.server.connected[token]
+	this.server.RUnlock()
+	if ok {
+		conn.Close()
+	}
 }
 
-func (this *RUDP) writeMsgInvalid(msg *udpData, token uint32) {
-	msg.b[msgType] = msgInvalid
+// 处理invalid消息
+func (this *RUDP) handleMsgInvalidS(msg *udpData) {
+	if msg.n != msgInvalidLength {
+		return
+	}
+	token := binary.BigEndian.Uint32(msg.b[msgInvalidToken:])
+	this.client.RLock()
+	conn, ok := this.client.connected[token]
+	this.client.RUnlock()
+	if ok {
+		conn.Close()
+	}
+}
+
+// 编码invalid消息
+func (this *RUDP) writeMsgInvalid(msg *udpData, _type byte, token uint32) {
+	msg.b[msgType] = _type
 	binary.BigEndian.PutUint32(msg.b[msgInvalidToken:], token)
-	this.conn.WriteToUDP(msg.b[:msgInvalidLength], msg.a)
+	msg.n = msgInvalidLength
 }

@@ -167,8 +167,10 @@ func (this *RUDP) handleUDPDataRoutine() {
 				this.handleMsgPing(msg)
 			case msgPong: // s->c
 				this.handleMsgPong(msg)
-			case msgInvalid: // c<->s，无效的连接
-				this.handleMsgInvalid(msg)
+			case msgInvalidC: // c<->s，无效的连接
+				this.handleMsgInvalidC(msg)
+			case msgInvalidS: // c<->s，无效的连接
+				this.handleMsgInvalidS(msg)
 			}
 			// 回收
 			_dataPool.Put(msg)
@@ -219,4 +221,21 @@ func (this *RUDP) checkWriteBuffer(conn *Conn, now time.Time) {
 		p = p.next
 	}
 	conn.wBuf.Unlock()
+}
+
+// 释放Conn的资源
+func (this *RUDP) closeConn(conn *Conn) {
+	if conn.cs == csC {
+		this.client.Lock()
+		delete(this.client.connected, conn.sToken)
+		delete(this.client.dialing, conn.cToken)
+		this.client.Unlock()
+	} else {
+		var key dialKey
+		key.Init(conn.rAddr, conn.cToken)
+		this.server.Lock()
+		delete(this.server.connected, conn.sToken)
+		delete(this.server.accepting, key)
+		this.server.Unlock()
+	}
 }

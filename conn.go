@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,9 +18,17 @@ const (
 	connStateConnect                  // c->s，发送connect消息，双向确认连接
 )
 
+type cs byte
+
+const (
+	csC cs = 0
+	csS cs = 1
+)
+
 // 创建一个新的Conn变量
-func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr, mss uint16) *Conn {
+func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr, mss uint16, cs cs) *Conn {
 	conn := new(Conn)
+	conn.cs = cs
 	conn.state = state
 	conn.rAddr = rAddr
 	conn.lAddr = this.conn.LocalAddr().(*net.UDPAddr)
@@ -33,18 +42,19 @@ func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr, mss uint16) *Conn
 // 保存连接的基本信息，实现可靠性算法
 type Conn struct {
 	lock          sync.RWMutex
-	state         connState      // 状态
-	rBuf          *readBuffer    // 读缓存
-	wBuf          *writeBuffer   // 写缓存
-	dataBytes     rwBytes        // 有效数据总字节
-	totalBytes    rwBytes        // 读写总字节
-	connectSignal chan struct{}  // 作为确定连接的信号
-	closeSignal   chan struct{}  // 关闭的信号
-	wait          sync.WaitGroup // 等待所有协程退出
-	lAddr         *net.UDPAddr   // 本地地址
-	rAddr         *net.UDPAddr   // 对端地址
-	cToken        uint32         // client连接随机token
-	sToken        uint32         // server连接随机token
+	state         connState     // 状态
+	rBuf          *readBuffer   // 读缓存
+	wBuf          *writeBuffer  // 写缓存
+	dataBytes     rwBytes       // 有效数据总字节
+	totalBytes    rwBytes       // 读写总字节
+	connectSignal chan struct{} // 作为确定连接的信号
+	closeSignal   chan struct{} // 关闭的信号
+	lAddr         *net.UDPAddr  // 本地地址
+	rAddr         *net.UDPAddr  // 对端地址
+	cToken        uint32        // client连接随机token
+	sToken        uint32        // server连接随机token
+	cs            cs            // 是客户端或者服务端的Conn
+	pingId        uint32        // ping消息的id
 }
 
 // 返回net.OpError
@@ -84,7 +94,7 @@ func (this *Conn) Read(b []byte) (int, error) {
 		for {
 			select {
 			case <-this.rBuf.enable:
-				n := this.rBuf.Read(b)
+				n := this.read(b)
 				if n > 0 {
 					return n, nil
 				}
@@ -101,7 +111,7 @@ func (this *Conn) Read(b []byte) (int, error) {
 	for {
 		select {
 		case <-this.rBuf.enable:
-			n := this.rBuf.Read(b)
+			n := this.read(b)
 			if n > 0 {
 				return n, nil
 			}
@@ -124,7 +134,7 @@ func (this *Conn) Write(b []byte) (int, error) {
 		for {
 			select {
 			case <-this.wBuf.enable:
-				n := this.wBuf.Write(b)
+				n := this.write(b)
 				b = b[n:]
 				if len(b) < 1 {
 					return m, nil
@@ -142,7 +152,7 @@ func (this *Conn) Write(b []byte) (int, error) {
 	for {
 		select {
 		case <-this.wBuf.enable:
-			n := this.wBuf.Write(b)
+			n := this.write(b)
 			b = b[n:]
 			if len(b) < 1 {
 				return m, nil
@@ -165,9 +175,6 @@ func (this *Conn) Close() error {
 	this.state = connStateClose
 	this.lock.Unlock()
 	close(this.connectSignal)
-	this.rBuf.cond.Signal()
-	this.wBuf.cond.Signal()
-	this.wait.Wait()
 	return nil
 }
 
@@ -204,6 +211,62 @@ func (this *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+// 写数据
+func (this *Conn) write(buf []byte) (n int) {
+	// 还能添加多少数据块
+	m := this.wBuf.Left()
+	if m < 1 {
+		return
+	}
+	// 没有数据
+	if this.wBuf.data == nil {
+		d := this.wBuf.GetData(msgData[this.cs], this.sToken, buf)
+		// 头
+		this.wBuf.data = d
+		// 尾=头
+		this.wBuf.tail = this.wBuf.data
+		m--
+		n += d.data.n
+		buf = buf[d.data.n:]
+	}
+	// 循环
+	for m > 0 && len(buf) > 0 {
+		d := this.wBuf.GetData(msgData[this.cs], this.sToken, buf)
+		// 添加到尾部
+		this.wBuf.tail.next = d
+		this.wBuf.tail = this.wBuf.tail.next
+		m--
+		n += d.data.n
+		buf = buf[d.data.n:]
+	}
+	return
+}
+
+// 读数据
+func (this *Conn) read(buf []byte) (n int) {
+	p := this.rBuf.data
+	i := 0
+	// 队列中，小于sn的都是可读的
+	for p != nil && p.sn < this.rBuf.nextSN {
+		// 拷贝
+		i = copy(buf[n:], p.buf[p.idx:])
+		n += i
+		p.idx += i
+		// 数据块读完了，移除，回收
+		if len(p.buf) == p.idx {
+			next := p.next
+			this.rBuf.PutData(p)
+			p = next
+			this.rBuf.len--
+		}
+		// 缓存读满了
+		if n == len(buf) {
+			return
+		}
+	}
+	return
+}
+
 // 编码dial消息
 func (this *Conn) dialMsg(msg *udpData) {
 	msg.b[msgType] = msgDial
@@ -226,5 +289,54 @@ func (this *Conn) acceptMsg(msg *udpData) {
 	binary.BigEndian.PutUint32(msg.b[msgAcceptReadBuffer:], this.rBuf.Left())
 	binary.BigEndian.PutUint32(msg.b[msgAcceptWriteBuffer:], this.wBuf.Left())
 	msg.n = msgAckLength
+	msg.a = this.rAddr
+}
+
+// 编码connect消息
+func (this *Conn) connectMsg(msg *udpData) {
+	msg.b[msgType] = msgConnect
+	binary.BigEndian.PutUint32(msg.b[msgConnectToken:], this.sToken)
+	msg.n = msgConnectLength
+	msg.a = this.rAddr
+}
+
+// 编码ack消息
+func (this *Conn) ackMsg(sn uint32, msg *udpData) {
+	msg.b[msgType] = msgAck[this.cs]
+	binary.BigEndian.PutUint32(msg.b[msgAckToken:], this.sToken)
+	binary.BigEndian.PutUint32(msg.b[msgAckSN:], sn)
+	binary.BigEndian.PutUint32(msg.b[msgAckMaxSN:], this.rBuf.nextSN-1)
+	binary.BigEndian.PutUint32(msg.b[msgAckBuffer:], this.rBuf.Left())
+	binary.BigEndian.PutUint64(msg.b[msgAckId:], this.rBuf.ackId)
+	this.rBuf.ackId++
+	msg.n = msgAckLength
+	msg.a = this.rAddr
+}
+
+// 编码close消息
+func (this *Conn) closeMsg(msg *udpData) {
+	msg.b[msgType] = msgClose[this.cs]
+	binary.BigEndian.PutUint32(msg.b[msgCloseToken:], this.sToken)
+	msg.n = msgCloseLength
+	msg.a = this.rAddr
+}
+
+// 编码ping消息
+func (this *Conn) pingMsg(msg *udpData) {
+	id := atomic.AddUint32(&this.pingId, 1)
+	msg.b[msgType] = msgPing
+	binary.BigEndian.PutUint32(msg.b[msgPingToken:], this.sToken)
+	binary.BigEndian.PutUint32(msg.b[msgPingId:], id)
+	msg.n = msgPingLength
+	msg.a = this.rAddr
+}
+
+// 编码pong消息
+func (this *Conn) pongMsg(msg *udpData, id uint32) {
+	msg.b[msgType] = msgPong
+	binary.BigEndian.PutUint32(msg.b[msgPongToken:], this.sToken)
+	binary.BigEndian.PutUint32(msg.b[msgPongId:], id)
+	binary.BigEndian.PutUint32(msg.b[msgPongBuffer:], this.rBuf.cap-this.rBuf.len)
+	msg.n = msgPongLength
 	msg.a = this.rAddr
 }

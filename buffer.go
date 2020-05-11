@@ -8,7 +8,6 @@ import (
 
 func newReadBuffer() *readBuffer {
 	p := new(readBuffer)
-	p.cond = sync.NewCond(&p.RWMutex)
 	p.enable = make(chan int)
 	return p
 }
@@ -16,7 +15,6 @@ func newReadBuffer() *readBuffer {
 func newWriteBuffer(mss uint16) *writeBuffer {
 	p := new(writeBuffer)
 	p.mss = mss
-	p.cond = sync.NewCond(&p.RWMutex)
 	p.enable = make(chan int)
 	return p
 }
@@ -32,7 +30,6 @@ type readData struct {
 // Conn的读缓存
 type readBuffer struct {
 	sync.RWMutex            // 锁
-	cond         *sync.Cond // 可写通知
 	enable       chan int   // 可读标志
 	pool         *readData  // 数据块缓存池
 	data         *readData  // 数据队列
@@ -76,33 +73,31 @@ func (this *readBuffer) PutData(p *readData) {
 	this.pool = p
 }
 
-// 读取数据
-func (this *readBuffer) Read(b []byte) (n int) {
-	p := this.data
-	i := 0
-	// 队列中，小于sn的都是可读的
-	for p != nil && p.sn < this.nextSN {
-		// 拷贝
-		i = copy(b[n:], p.buf[p.idx:])
-		n += i
-		p.idx += i
-		// 数据块读完了，移除，回收
-		if len(p.buf) == p.idx {
-			next := p.next
-			this.PutData(p)
-			p = next
-			this.len--
-		}
-		// 缓存读满了
-		if n == len(b) {
-			return
+// 添加数据
+func (this *readBuffer) Add(msg*udpData,cs cs) bool {
+	sn := binary.BigEndian.Uint32(msg.b[msgDataSN:])
+	// 检查sn是否在接收缓存范围
+	conn.rBuf.Lock()
+	// 超过了接收缓存的最大序列号
+	if sn >= conn.rBuf.maxSN {
+		conn.rBuf.Unlock()
+		return
+	}
+	// 是新的数据
+	if sn >= conn.rBuf.nextSN {
+		conn.rBuf.Add(sn, msg.b[msgDataPayload:msg.n])
+	}
+	// 可读
+	if sn == conn.rBuf.nextSN {
+		conn.rBuf.nextSN++
+		conn.rBuf.ackId = 0
+		select {
+		case conn.rBuf.enable <- 1:
+		default:
 		}
 	}
-	return
-}
-
-// 添加数据
-func (this *readBuffer) Add(sn uint32, buf []byte) {
+	conn.ackMsg(sn, msg)
+	conn.rBuf.Unlock()
 	// 第一个数据块
 	if this.data == nil {
 		this.data = this.GetData(sn, buf)
@@ -141,6 +136,7 @@ func (this *readBuffer) Add(sn uint32, buf []byte) {
 	prev.next = this.GetData(sn, buf)
 	this.len++
 	this.time = time.Now()
+	return true
 }
 
 // 写缓存队列node
@@ -155,7 +151,6 @@ type writeData struct {
 // Conn的写缓存
 type writeBuffer struct {
 	sync.RWMutex               // 锁
-	cond         *sync.Cond    // 可写通知
 	enable       chan int      // 可写通知
 	pool         *writeData    // 可用的数据块列表
 	data         *writeData    // 等待确认的消息发送队列
@@ -240,33 +235,68 @@ func (this *writeBuffer) PutData(p *writeData) {
 	this.pool = p
 }
 
-// 写数据
-func (this *writeBuffer) Write(msg byte, token uint32, buf []byte) (n int) {
-	// 还能添加多少数据块
-	m := this.Left()
-	if m < 1 {
-		return
-	}
-	// 没有数据
-	if this.data == nil {
-		d := this.GetData(msg, token, buf)
-		// 头
-		this.data = d
-		// 尾=头
-		this.tail = this.data
-		m--
-		n += d.data.n
-		buf = buf[d.data.n:]
-	}
-	// 循环
-	for m > 0 && len(buf) > 0 {
-		d := this.GetData(msg, token, buf)
-		// 添加到尾部
-		this.tail.next = this.GetData(msg, token, buf)
-		this.tail = this.tail.next
-		m--
-		n += d.data.n
-		buf = buf[d.data.n:]
-	}
-	return
+func (this *writeBuffer)Remove(msg*udpData){
+
+
+// 检查发送队列
+conn.writeBuffer.Lock()
+if conn.writeBuffer.data == nil {
+conn.writeBuffer.Unlock()
+return
+}
+sn := binary.BigEndian.Uint32(msg.b[msgAckSN:])
+max_sn := binary.BigEndian.Uint32(msg.b[msgAckMaxSN:])
+p := conn.writeBuffer.data
+ok := false
+if max_sn >= sn {
+// 从发送队列移除小于max_sn的数据块
+for p != nil {
+if p.sn > sn {
+break
+}
+if p.sn == sn {
+// 计算RTO
+conn.writeBuffer.CalcRTO(p)
+}
+// 移除
+n := p.next
+conn.writeBuffer.putData(p)
+p = n
+}
+conn.writeBuffer.data = p
+conn.writeBuffer.UpdateAck(max_sn, msg)
+ok = true
+} else {
+// 从发送队列移除指定sn的数据块
+if p.sn == sn {
+// 链表头
+conn.writeBuffer.data = p.next
+conn.writeBuffer.UpdateAck(sn, msg)
+conn.writeBuffer.putData(p)
+ok = true
+} else {
+next := p.next
+for next != nil {
+if next.sn > sn {
+break
+}
+if next.sn == sn {
+// 计算RTO
+conn.writeBuffer.CalcRTO(next)
+// 移除
+p.next = next.next
+conn.writeBuffer.putData(next)
+conn.writeBuffer.UpdateAck(sn, msg)
+ok = true
+break
+}
+next = p.next
+}
+}
+}
+conn.writeBuffer.Unlock()
+// 是否可写入新数据
+if ok {
+conn.writeBuffer.Signal()
+}
 }

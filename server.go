@@ -96,7 +96,7 @@ func (this *RUDP) closeServer() {
 
 // 服务端Conn写协程
 func (this *RUDP) acceptConnRoutine(conn *Conn, timeout time.Duration) {
-	conn.wait.Add(1)
+	this.wait.Add(1)
 	// 开始时间
 	start_time := time.Now()
 	// 初始化accept消息
@@ -106,7 +106,8 @@ func (this *RUDP) acceptConnRoutine(conn *Conn, timeout time.Duration) {
 	timer := time.NewTimer(0)
 	defer func() {
 		timer.Stop()
-		conn.wait.Done()
+		this.closeConn(conn)
+		this.wait.Done()
 	}()
 	// 发送accept消息循环
 AccepLoop:
@@ -154,7 +155,7 @@ AccepLoop:
 // 创建一个新的服务端Conn，拆分handleMsgDial()代码
 func (this *RUDP) newAcceptConn(cToken uint32, cAddr *net.UDPAddr) *Conn {
 	// 不存在，第一次收到消息
-	conn := this.newConn(connStateAccept, cAddr, DetectMSS(cAddr))
+	conn := this.newConn(connStateAccept, cAddr, DetectMSS(cAddr), csS)
 	// 产生服务端token
 	conn.cToken = cToken
 	conn.sToken = this.server.token
