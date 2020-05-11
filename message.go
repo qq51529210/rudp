@@ -3,7 +3,6 @@ package rudp
 import (
 	"encoding/binary"
 	"github.com/qq51529210/log"
-	"net"
 	"sync"
 	"time"
 )
@@ -45,10 +44,10 @@ const (
 	maxSN      = 0xffffffff - 1                  // 最大的序号，32位即将溢出
 )
 
-var _msgPool sync.Pool
+var _dataPool sync.Pool
 
 func init() {
-	_msgPool.New = func() interface{} {
+	_dataPool.New = func() interface{} {
 		return new(udpData)
 	}
 }
@@ -62,8 +61,7 @@ const (
 	msgDialToken       = msgDialVersion + 4     // 客户端的随机token
 	msgDialLocalIP     = msgDialToken + 4       // 客户端的监听ip
 	msgDialLocalPort   = msgDialLocalIP + 16    // 客户端的监听端口
-	msgDialMSS         = msgDialLocalPort + 2   // 客户端到服务端链路的检测的mss
-	msgDialReadBuffer  = msgDialMSS + 2         // 客户端的接收缓存队列长度，窗口控制初始参考值
+	msgDialReadBuffer  = msgDialLocalPort + 2   // 客户端的接收缓存队列长度，窗口控制初始参考值
 	msgDialWriteBuffer = msgDialReadBuffer + 4  // 客户端的发送缓存队列长度，窗口控制初始参考值
 	msgDialTimeout     = msgDialWriteBuffer + 4 // 客户端的超时
 	msgDialLength      = msgDialTimeout + 8     // 数据大小
@@ -74,15 +72,14 @@ func (this *RUDP) handleMsgDial(msg *udpData) {
 	if msg.n != msgDialLength || msg.b[msgDialVersion] != msgVersion {
 		return
 	}
-	// token
 	token := binary.BigEndian.Uint32(msg.b[msgDialToken:])
-	// 检查token是否存在server.accepting
+	// 获取Conn
 	var key dialKey
 	key.Init(msg.a, token)
 	this.server.Lock()
 	conn, ok := this.server.accepting[key]
+	// 存在，这里不处理
 	if ok {
-		// 存在，这里不处理
 		// connStateAccepting: 发送accept消息的协程在处理
 		// connStateConnected: 已经连接，说明是重复的过期的消息
 		// connStateRefused: 服务端不可能，逻辑bug
@@ -90,24 +87,24 @@ func (this *RUDP) handleMsgDial(msg *udpData) {
 		this.server.Unlock()
 		return
 	}
-	// 新的连接
+	// 不存在，新的连接
 	conn = this.newAcceptConn(token, msg.a)
+	// 创建失败
 	if conn == nil {
 		this.server.Unlock()
-		// 发送msgRefuse消息，然后返回
+		// 发送refuse消息
 		msg.b[msgType] = msgRefuse
 		binary.BigEndian.PutUint32(msg.b[msgRefuseToken:], token)
-		// 这里不需要处理错误，如果net.UDPConn出错，readUDPDataRoutine就会退出
-		this.writeMessageToConn(msg.b[:msgRefuseLength], msg.a, conn)
+		this.WriteTo(msg.b[:msgRefuseLength], msg.a)
+		// 返回
 		return
 	}
 	// 添加到列表
-	this.server.connected[conn.sToken] = conn
 	this.server.accepting[key] = conn
+	this.server.connected[conn.sToken] = conn
 	this.server.Unlock()
-	// 启动写协程
-	conn.waitQuit.Add(1)
-	go this.acceptConnRoutine(conn, token, time.Duration(binary.BigEndian.Uint64(msg.b[msgDialTimeout:])))
+	// 启动服务端Conn写协程
+	go this.acceptConnRoutine(conn, time.Duration(binary.BigEndian.Uint64(msg.b[msgDialTimeout:])))
 }
 
 // msgAccept
@@ -117,8 +114,7 @@ const (
 	msgAcceptSToken      = msgAcceptCToken + 4      // 服务端的随机token，连接会话token
 	msgAcceptClientIP    = msgAcceptSToken + 4      // 客户端的公网ip
 	msgAcceptClientPort  = msgAcceptClientIP + 16   // 客户端的公网ip
-	msgAcceptMSS         = msgAcceptClientPort + 2  // 服务端到客户端链路的检测的mss
-	msgAcceptReadBuffer  = msgAcceptMSS + 2         // 服务端的接收缓存队列长度，窗口控制初始参考值
+	msgAcceptReadBuffer  = msgAcceptClientPort + 2  // 服务端的接收缓存队列长度，窗口控制初始参考值
 	msgAcceptWriteBuffer = msgAcceptReadBuffer + 4  // 服务端的发送缓存队列长度，窗口控制初始参考值
 	msgAcceptLength      = msgAcceptWriteBuffer + 4 // 数据大小
 )
@@ -128,33 +124,36 @@ func (this *RUDP) handleMsgAccept(msg *udpData) {
 	if msg.n != msgAcceptLength || msg.b[msgAcceptVersion] != msgVersion {
 		return
 	}
-	// token对
-	ctoken := binary.BigEndian.Uint32(msg.b[msgAcceptCToken:])
-	stoken := binary.BigEndian.Uint32(msg.b[msgAcceptSToken:])
-	// 检查ctoken是否存在client.dialing
+	cToken := binary.BigEndian.Uint32(msg.b[msgAcceptCToken:])
+	sToken := binary.BigEndian.Uint32(msg.b[msgAcceptSToken:])
+	// 获取conn
 	this.client.RLock()
-	conn, ok := this.client.dialing[ctoken]
+	conn, ok := this.client.dialing[cToken]
 	this.client.RUnlock()
-	if ok {
-		conn.Lock()
-		switch conn.connState {
-		case connStateDial:
-			conn.sToken = stoken
-			conn.connState = connStateConnect
-			conn.Unlock()
-			// 通知
-			close(conn.connectSignal)
-			// 发送msgConnect
-			this.writeMsgConnect(msg, stoken)
-		case connStateConnect:
-			// 重复收到msgAccept
-			conn.Unlock()
-			// 发送msgConnect
-			this.writeMsgConnect(msg, stoken)
-		default:
-			// 其他不处理
-			conn.Unlock()
-		}
+	// 不存在
+	if !ok {
+		// 发送invalid消息，通知对方
+		return
+	}
+	// 检查状态
+	conn.lock.Lock()
+	switch conn.state {
+	case connStateDial:
+		conn.sToken = sToken
+		conn.state = connStateConnect
+		conn.lock.Unlock()
+		// 通知
+		close(conn.connectSignal)
+		// 发送msgConnect
+		this.writeMsgConnect(msg, sToken)
+	case connStateConnect:
+		// 重复收到msgAccept
+		conn.lock.Unlock()
+		// 发送msgConnect
+		this.writeMsgConnect(msg, sToken)
+	default:
+		// 其他不处理
+		conn.lock.Unlock()
 	}
 }
 
@@ -241,7 +240,7 @@ func (this *RUDP) handleMsgDataC(msg *udpData) {
 	if !ok {
 		// 没有
 		this.writeMsgInvalid(msg, token)
-		_msgPool.Put(msg)
+		_dataPool.Put(msg)
 		return
 	}
 	this.handleMsgData(conn, msg, csServer)
@@ -256,7 +255,7 @@ func (this *RUDP) handleMsgDataS(msg *udpData) {
 	if !ok {
 		// 没有
 		this.writeMsgInvalid(msg, token)
-		_msgPool.Put(msg)
+		_dataPool.Put(msg)
 		return
 	}
 	this.handleMsgData(conn, msg, csClient)
@@ -316,7 +315,7 @@ func (this *RUDP) handleMsgAckC(msg *udpData) {
 	conn, ok := this.client.connected[binary.BigEndian.Uint32(msg.b[msgAckToken:])]
 	this.client.RUnlock()
 	if !ok {
-		_msgPool.Put(msg)
+		_dataPool.Put(msg)
 		return
 	}
 	this.handleMsgAck(conn, msg)
@@ -327,7 +326,7 @@ func (this *RUDP) handleMsgAckS(msg *udpData) {
 	conn, ok := this.client.connected[binary.BigEndian.Uint32(msg.b[msgAckToken:])]
 	this.client.RUnlock()
 	if !ok {
-		_msgPool.Put(msg)
+		_dataPool.Put(msg)
 		return
 	}
 	this.handleMsgAck(conn, msg)

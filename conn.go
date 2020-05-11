@@ -1,6 +1,7 @@
 package rudp
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
@@ -8,6 +9,7 @@ import (
 
 type connState int
 
+// Conn的状态
 const (
 	connStateClose   connState = iota // c<->s，连接超时/被应用层关闭，发送close消息
 	connStateDial                     // c->s，发送dial消息
@@ -16,17 +18,13 @@ const (
 )
 
 // 创建一个新的Conn变量
-func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr) *Conn {
+func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr, mss uint16) *Conn {
 	conn := new(Conn)
-	conn.connState = state
+	conn.state = state
 	conn.rAddr = rAddr
 	conn.lAddr = this.conn.LocalAddr().(*net.UDPAddr)
-	//conn.readBuffer.Cond = sync.NewCond(&conn.readBuffer.RWMutex)
-	conn.readBuffer.enable = make(chan int)
-	conn.SetReadBuffer(this.connReadBuffer)
-	//conn.writeBuffer.Cond = sync.NewCond(&conn.writeBuffer.RWMutex)
-	conn.writeBuffer.enable = make(chan int)
-	conn.SetWriteBuffer(this.connWriteBuffer)
+	conn.rBuf = newReadBuffer()
+	conn.wBuf = newWriteBuffer(mss)
 	conn.connectSignal = make(chan struct{})
 	conn.closeSignal = make(chan struct{})
 	return conn
@@ -34,14 +32,15 @@ func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr) *Conn {
 
 // 保存连接的基本信息，实现可靠性算法
 type Conn struct {
-	connState                    // 状态
-	*readBuffer                  // 读缓存
-	*writeBuffer                 // 写缓存
-	dataBytes     ioBytes        // 有效数据总字节
-	totalBytes    ioBytes        // 读写总字节
+	lock          sync.RWMutex
+	state         connState      // 状态
+	rBuf          *readBuffer    // 读缓存
+	wBuf          *writeBuffer   // 写缓存
+	dataBytes     rwBytes        // 有效数据总字节
+	totalBytes    rwBytes        // 读写总字节
 	connectSignal chan struct{}  // 作为确定连接的信号
-	closeSignal   chan struct{}  // 作为确定连接的信号
-	waitQuit      sync.WaitGroup // 等待所有协程退出
+	closeSignal   chan struct{}  // 关闭的信号
+	wait          sync.WaitGroup // 等待所有协程退出
 	lAddr         *net.UDPAddr   // 本地地址
 	rAddr         *net.UDPAddr   // 对端地址
 	cToken        uint32         // client连接随机token
@@ -59,104 +58,173 @@ func (this *Conn) netOpError(op string, err error) error {
 	}
 }
 
+// 设置读缓存大小（字节）
 func (this *Conn) SetReadBuffer(n int) error {
-	this.readBuffer.Lock()
-	this.readBuffer.max = maxInt(1, n/int(this.mss))
-	this.readBuffer.Unlock()
+	this.rBuf.Lock()
+	this.rBuf.cap = uint32(n)
+	this.rBuf.Unlock()
 	return nil
 }
 
+// 设置写缓存大小（字节）
 func (this *Conn) SetWriteBuffer(n int) error {
-	this.writeBuffer.Lock()
-	this.writeBuffer.max = maxInt(1, n/int(this.mss))
-	this.writeBuffer.Unlock()
+	this.wBuf.Lock()
+	this.wBuf.cap = uint32(n)
+	this.wBuf.Unlock()
 	return nil
 }
 
+// net.Conn接口
 func (this *Conn) Read(b []byte) (int, error) {
-	this.readBuffer.RLock()
-	timeout := this.readBuffer.timeout
-	this.readBuffer.RUnlock()
+	this.rBuf.RLock()
+	timeout := this.rBuf.timeout
+	this.rBuf.RUnlock()
+	// 没有设置超时
 	if timeout.IsZero() {
-		select {
-		case <-this.readBuffer.enable:
-			return this.readBuffer.read(b), nil
-		case <-this.connectSignal:
-			return 0, this.netError("read", errClosed("conn"))
+		for {
+			select {
+			case <-this.rBuf.enable:
+				n := this.rBuf.Read(b)
+				if n > 0 {
+					return n, nil
+				}
+			case <-this.connectSignal:
+				return 0, this.netOpError("read", closeErr("conn"))
+			}
 		}
 	}
+	// 已经超时，不需要以下的步骤
 	duration := timeout.Sub(time.Now())
 	if duration <= 0 {
-		return 0, this.netError("read", errOP("timeout"))
+		return 0, this.netOpError("read", opErr("timeout"))
 	}
-	select {
-	case <-this.readBuffer.enable:
-		return this.readBuffer.read(b), nil
-	case <-this.connectSignal:
-		return 0, this.netError("read", errClosed("conn"))
-	case <-time.After(duration):
-		return 0, this.netError("read", errOP("timeout"))
+	for {
+		select {
+		case <-this.rBuf.enable:
+			n := this.rBuf.Read(b)
+			if n > 0 {
+				return n, nil
+			}
+		case <-this.connectSignal:
+			return 0, this.netOpError("read", closeErr("conn"))
+		case <-time.After(duration):
+			return 0, this.netOpError("read", opErr("timeout"))
+		}
 	}
 }
 
+// net.Conn接口
 func (this *Conn) Write(b []byte) (int, error) {
-	this.writeBuffer.RLock()
-	timeout := this.writeBuffer.timeout
-	this.writeBuffer.RUnlock()
+	this.wBuf.RLock()
+	timeout := this.wBuf.timeout
+	this.wBuf.RUnlock()
+	m := len(b)
+	// 没有设置超时
 	if timeout.IsZero() {
-		select {
-		case <-this.writeBuffer.enable:
-			return this.write(b), nil
-		case <-this.connectSignal:
-			return 0, this.netError("read", errClosed("conn"))
+		for {
+			select {
+			case <-this.wBuf.enable:
+				n := this.wBuf.Write(b)
+				b = b[n:]
+				if len(b) < 1 {
+					return m, nil
+				}
+			case <-this.connectSignal:
+				return 0, this.netOpError("write", closeErr("conn"))
+			}
 		}
 	}
+	// 已经超时，不需要以下的步骤
 	duration := timeout.Sub(time.Now())
 	if duration <= 0 {
-		return 0, this.netError("read", errOP("timeout"))
+		return 0, this.netOpError("write", opErr("timeout"))
 	}
-	select {
-	case <-this.writeBuffer.enable:
-		return this.write(b), nil
-	case <-this.connectSignal:
-		return 0, this.netError("read", errClosed("conn"))
-	case <-time.After(duration):
-		return 0, this.netError("write", errOP("timeout"))
+	for {
+		select {
+		case <-this.wBuf.enable:
+			n := this.wBuf.Write(b)
+			b = b[n:]
+			if len(b) < 1 {
+				return m, nil
+			}
+		case <-this.connectSignal:
+			return 0, this.netOpError("write", closeErr("conn"))
+		case <-time.After(duration):
+			return 0, this.netOpError("write", opErr("timeout"))
+		}
 	}
 }
 
-func (this *Conn) write(b []byte) int {
-	this.writeBuffer.Lock()
-	this.writeBuffer.Unlock()
-}
-
+// net.Conn接口
 func (this *Conn) Close() error {
+	this.lock.Lock()
+	if this.state == connStateClose {
+		this.lock.Unlock()
+		return this.netOpError("close", closeErr("conn"))
+	}
+	this.state = connStateClose
+	this.lock.Unlock()
+	close(this.connectSignal)
+	this.rBuf.cond.Signal()
+	this.wBuf.cond.Signal()
+	this.wait.Wait()
 	return nil
 }
 
+// net.Conn接口
 func (this *Conn) LocalAddr() net.Addr {
 	return this.lAddr
 }
 
+// net.Conn接口
 func (this *Conn) RemoteAddr() net.Addr {
 	return this.rAddr
 }
 
+// net.Conn接口
 func (this *Conn) SetDeadline(t time.Time) error {
-	this.rto = t
-	this.wto = t
+	this.SetReadDeadline(t)
+	this.SetWriteDeadline(t)
 	return nil
 }
 
+// net.Conn接口
 func (this *Conn) SetReadDeadline(t time.Time) error {
-	this.rto = t
+	this.rBuf.Lock()
+	this.rBuf.timeout = t
+	this.rBuf.Unlock()
 	return nil
 }
 
+// net.Conn接口
 func (this *Conn) SetWriteDeadline(t time.Time) error {
-	this.wto = t
+	this.wBuf.Lock()
+	this.wBuf.timeout = t
+	this.wBuf.Unlock()
 	return nil
 }
 
-func (this *Conn) checkWriteBuffer(conn *net.UDPConn, now time.Time) error {
+// 编码dial消息
+func (this *Conn) dialMsg(msg *udpData) {
+	msg.b[msgType] = msgDial
+	binary.BigEndian.PutUint32(msg.b[msgDialVersion:], msgVersion)
+	copy(msg.b[msgDialLocalIP:], this.lAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.b[msgDialLocalPort:], uint16(this.lAddr.Port))
+	binary.BigEndian.PutUint32(msg.b[msgDialReadBuffer:], this.rBuf.Left())
+	binary.BigEndian.PutUint32(msg.b[msgDialWriteBuffer:], this.wBuf.Left())
+	msg.n = msgDialLength
+	msg.a = this.rAddr
+}
+
+// 编码accept消息
+func (this *Conn) acceptMsg(msg *udpData) {
+	msg.b[msgType] = msgAccept
+	binary.BigEndian.PutUint32(msg.b[msgAcceptCToken:], this.cToken)
+	binary.BigEndian.PutUint32(msg.b[msgAcceptSToken:], this.sToken)
+	copy(msg.b[msgAcceptClientIP:], this.rAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.b[msgAcceptClientPort:], uint16(this.rAddr.Port))
+	binary.BigEndian.PutUint32(msg.b[msgAcceptReadBuffer:], this.rBuf.Left())
+	binary.BigEndian.PutUint32(msg.b[msgAcceptWriteBuffer:], this.wBuf.Left())
+	msg.n = msgAckLength
+	msg.a = this.rAddr
 }

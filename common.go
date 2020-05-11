@@ -1,5 +1,32 @@
 package rudp
 
+func defaultInt(n1, n2 int) int {
+	if n1 < 1 {
+		return n2
+	}
+	return n1
+}
+
+func maxInt(n1, n2 int) int {
+	if n1 > n2 {
+		return n1
+	}
+	return n2
+}
+
+func minInt(n1, n2 int) int {
+	if n1 > n2 {
+		return n2
+	}
+	return n1
+}
+
+// io字节
+type rwBytes struct {
+	r uint64
+	w uint64
+}
+
 type Config struct {
 	Listen          string `json:"listen"`            // udp监听地址，不能为空
 	UDPDataQueue    int    `json:"udp_data_queue"`    // udp原始数据缓存队列，默认是1024

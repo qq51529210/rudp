@@ -1,11 +1,8 @@
 package rudp
 
 import (
-	"github.com/qq51529210/log"
-	"io"
 	"math/rand"
 	"net"
-	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -13,27 +10,6 @@ import (
 
 // 随机数
 var _rand = rand.New(rand.NewSource(time.Now().Unix()))
-
-func defaultInt(n1, n2 int) int {
-	if n1 < 1 {
-		return n2
-	}
-	return n1
-}
-
-func maxInt(n1, n2 int) int {
-	if n1 > n2 {
-		return n1
-	}
-	return n2
-}
-
-func minInt(n1, n2 int) int {
-	if n1 > n2 {
-		return n2
-	}
-	return n1
-}
 
 // 为了避免分包，选择最合适的mss
 var DetectMSS = func(*net.UDPAddr) uint16 {
@@ -59,7 +35,6 @@ func NewWithConfig(cfg *Config) (*RUDP, error) {
 		return nil, err
 	}
 	p := new(RUDP)
-	p.logger = os.Stdout
 	p.conn = conn
 	p.closeSignal = make(chan struct{})
 	p.udpDataQueue = make(chan *udpData, defaultInt(cfg.UDPDataQueue, 1024))
@@ -73,12 +48,6 @@ func NewWithConfig(cfg *Config) (*RUDP, error) {
 		go p.handleUDPDataRoutine()
 	}
 	return p, nil
-}
-
-// io字节
-type rwBytes struct {
-	r uint64
-	w uint64
 }
 
 // 表示一个udp的原始数据包
@@ -118,14 +87,14 @@ func (this *RUDP) LocalAddr() net.Addr {
 // 关闭RUDP，该RUDP对象，不可以再使用，net.Listener接口
 func (this *RUDP) Close() error {
 	// 关闭底层Conn
-	this.Lock()
+	this.lock.Lock()
 	if this.conn == nil {
-		this.Unlock()
-		return this.opError("close", nil, errClosed("rudp"))
+		this.lock.Unlock()
+		return this.netOpError("close", closeErr("rudp"))
 	}
 	this.conn.Close()
 	this.conn = nil
-	this.Unlock()
+	this.lock.Unlock()
 	// 通知所有协程退出
 	close(this.closeSignal)
 	// 等待所有协程退出
@@ -144,11 +113,10 @@ func (this *RUDP) readUDPDataRoutine() {
 	var err error
 	for {
 		// 读取
-		msg := _msgPool.Get().(*udpData)
+		msg := _dataPool.Get().(*udpData)
 		msg.n, msg.a, err = this.conn.ReadFromUDP(msg.b[:])
 		if err != nil {
 			// 出错，关闭
-			log.Print(this.logger, log.LevelError, 0, log.FileLineFullPath, err.Error())
 			this.Close()
 			return
 		}
@@ -162,7 +130,7 @@ func (this *RUDP) readUDPDataRoutine() {
 			return
 		default:
 			// 等待处理队列已满，添加不进，丢弃
-			_msgPool.Put(msg)
+			_dataPool.Put(msg)
 		}
 	}
 }
@@ -203,7 +171,7 @@ func (this *RUDP) handleUDPDataRoutine() {
 				this.handleMsgInvalid(msg)
 			}
 			// 回收
-			_msgPool.Put(msg)
+			_dataPool.Put(msg)
 		case <-this.closeSignal:
 			// rudp关闭信号
 			return
@@ -212,12 +180,43 @@ func (this *RUDP) handleUDPDataRoutine() {
 }
 
 // 返回net.OpError对象
-func (this *RUDP) netOpError(op string, rAddr net.Addr, err error) error {
+func (this *RUDP) netOpError(op string, err error) error {
 	return &net.OpError{
 		Op:     op,
 		Net:    "udp",
-		Source: rAddr,
+		Source: nil,
 		Addr:   this.conn.LocalAddr(),
 		Err:    err,
 	}
+}
+
+// 向conn发送udp数据
+func (this *RUDP) writeToConn(msg *udpData, conn *Conn) {
+	n, err := this.conn.WriteToUDP(msg.b[:msg.n], msg.a)
+	if err == nil {
+		this.totalBytes.w += uint64(n)
+		conn.totalBytes.w += uint64(n)
+	}
+}
+
+// Conn发送队列超时重传检查
+func (this *RUDP) checkWriteBuffer(conn *Conn, now time.Time) {
+	conn.wBuf.Lock()
+	// 对方能接受的数据量，不能接受，则单发一个
+	n := maxInt(1, int(conn.wBuf.canWrite))
+	p := conn.wBuf.data
+	for p != nil && n > 0 {
+		// 距离上一次的发送，是否超时
+		if now.Sub(p.last) >= conn.wBuf.rto {
+			this.writeToConn(&p.data, conn)
+			// 记录发送时间
+			if p.first.IsZero() {
+				p.first = now
+			}
+			p.last = now
+			n--
+		}
+		p = p.next
+	}
+	conn.wBuf.Unlock()
 }

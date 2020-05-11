@@ -63,8 +63,8 @@ func (this *RUDP) SetAcceptRTO(rto time.Duration) {
 // net.Listener接口
 func (this *RUDP) Accept() (net.Conn, error) {
 	// 不作为服务端
-	if this.accepted == nil {
-		return nil, this.opError("listen", nil, errOP("rudp is no a server"))
+	if this.server.accepted == nil {
+		return nil, this.netOpError("listen", opErr("rudp is no a server"))
 	}
 	select {
 	case conn, ok := <-this.server.accepted:
@@ -75,7 +75,7 @@ func (this *RUDP) Accept() (net.Conn, error) {
 	case <-this.closeSignal:
 		// rudp关闭信号
 	}
-	return nil, this.opError("listen", nil, errClosed("rudp"))
+	return nil, this.netOpError("listen", closeErr("rudp"))
 }
 
 // net.Listener接口
@@ -95,80 +95,66 @@ func (this *RUDP) closeServer() {
 }
 
 // 服务端Conn写协程
-func (this *RUDP) acceptConnRoutine(conn *Conn, cToken uint32, cto time.Duration) {
-	defer conn.waitQuit.Done()
-	// 初始化msgAccept
-	var msg message
-	this.encodeMsgAccept(conn, cToken, &msg)
-	// 发送msgAccept
-	this.writeMsgAcceptLoop(conn, &msg, cto)
-	// 检查发送队列
-	timer := time.NewTimer(conn.rto)
-	var err error
-	for {
-		select {
-		case <-this.closeSignal:
-			// rudp被关闭
-			return
-		case <-conn.closeSignal:
-			// conn被关闭
-			return
-		case now := <-timer.C:
-			// 重传超时
-			err = conn.checkWriteBuffer(this.conn, now)
-			if err != nil {
-				return
-			}
-		}
-	}
-}
-
-// 发送msgAccept循环
-func (this *RUDP) writeMsgAcceptLoop(conn *Conn, msg *message, cto time.Duration) {
-	ticker := time.NewTicker(this.server.acceptRTO)
-	defer ticker.Stop()
-	// 发送msgAccept
+func (this *RUDP) acceptConnRoutine(conn *Conn, timeout time.Duration) {
+	conn.wait.Add(1)
+	// 开始时间
 	start_time := time.Now()
+	// 初始化accept消息
+	msg := _dataPool.Get().(*udpData)
+	conn.acceptMsg(msg)
+	// 超时计时器
+	timer := time.NewTimer(0)
+	defer func() {
+		timer.Stop()
+		conn.wait.Done()
+	}()
+	// 发送accept消息循环
+AccepLoop:
 	for {
 		select {
-		case now := <-ticker.C:
-			// 是否超时
-			if now.Sub(start_time) >= cto {
+		case now := <-timer.C:
+			// 超时
+			if now.Sub(start_time) >= timeout {
 				// 关闭
 				conn.Close()
 				return
 			}
-			// 发送消息间隔
-			this.writeMessageToConn(msg.b[:msgAcceptLength], conn.rAddr, conn)
+			// 重发
+			this.writeToConn(msg, conn)
+			// 重置计时器
+			timer.Reset(this.server.acceptRTO)
 		case <-this.closeSignal:
-			// rudp被关闭
+			// rudp关闭信号
 			return
 		case <-conn.connectSignal:
-			// 连接通知
-			return
+			// Conn连接通知
+			break AccepLoop
 		case <-conn.closeSignal:
-			// 连接关闭
+			// Conn关闭信号
 			return
 		}
 	}
-}
-
-// 编码msgAccept，拆分acceptConnRoutine()代码
-func (this *RUDP) encodeMsgAccept(conn *Conn, cToken uint32, msg *message) {
-	msg.b[msgType] = msgAccept
-	binary.BigEndian.PutUint32(msg.b[msgAcceptCToken:], cToken)
-	binary.BigEndian.PutUint32(msg.b[msgAcceptSToken:], conn.sToken)
-	copy(msg.b[msgAcceptClientIP:], conn.rAddr.IP.To16())
-	binary.BigEndian.PutUint16(msg.b[msgAcceptClientPort:], uint16(conn.rAddr.Port))
-	binary.BigEndian.PutUint16(msg.b[msgAcceptMSS:], conn.mss)
-	binary.BigEndian.PutUint32(msg.b[msgAcceptReadBuffer:], conn.readBuffer.Free())
-	binary.BigEndian.PutUint32(msg.b[msgAcceptWriteBuffer:], conn.writeBuffer.Free())
+	for {
+		select {
+		case <-this.closeSignal:
+			// rudp关闭信号
+			return
+		case <-conn.closeSignal:
+			// Conn关闭信号
+			return
+		case now := <-timer.C:
+			// 超时重传检查
+			this.checkWriteBuffer(conn, now)
+			// 重置计时器
+			timer.Reset(this.server.acceptRTO)
+		}
+	}
 }
 
 // 创建一个新的服务端Conn，拆分handleMsgDial()代码
 func (this *RUDP) newAcceptConn(cToken uint32, cAddr *net.UDPAddr) *Conn {
 	// 不存在，第一次收到消息
-	conn := this.newConn(connStateAccept, cAddr)
+	conn := this.newConn(connStateAccept, cAddr, DetectMSS(cAddr))
 	// 产生服务端token
 	conn.cToken = cToken
 	conn.sToken = this.server.token
@@ -184,7 +170,6 @@ func (this *RUDP) newAcceptConn(cToken uint32, cAddr *net.UDPAddr) *Conn {
 		this.server.token++
 		// 连接耗尽，2^32，理论上现有计算机不可能
 		if conn.sToken == tkn {
-			this.server.Unlock()
 			return nil
 		}
 	}
