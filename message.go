@@ -65,7 +65,8 @@ const (
 	msgDialToken       = msgDialVersion + 4     // 客户端的随机token
 	msgDialLocalIP     = msgDialToken + 4       // 客户端的监听ip
 	msgDialLocalPort   = msgDialLocalIP + 16    // 客户端的监听端口
-	msgDialReadBuffer  = msgDialLocalPort + 2   // 客户端的接收缓存队列长度，窗口控制初始参考值
+	msgDialMSS         = msgDialLocalPort + 2   // 客户端的发送的数据块大小，服务端窗口控制参考值
+	msgDialReadBuffer  = msgDialMSS + 2         // 客户端的接收缓存队列长度，窗口控制初始参考值
 	msgDialWriteBuffer = msgDialReadBuffer + 4  // 客户端的发送缓存队列长度，窗口控制初始参考值
 	msgDialTimeout     = msgDialWriteBuffer + 4 // 客户端的超时
 	msgDialLength      = msgDialTimeout + 8     // 消息大小
@@ -118,7 +119,8 @@ const (
 	msgAcceptSToken      = msgAcceptCToken + 4      // 服务端的随机token，连接会话token
 	msgAcceptClientIP    = msgAcceptSToken + 4      // 客户端的公网ip
 	msgAcceptClientPort  = msgAcceptClientIP + 16   // 客户端的公网ip
-	msgAcceptReadBuffer  = msgAcceptClientPort + 2  // 服务端的接收缓存队列长度，窗口控制初始参考值
+	msgAcceptMSS         = msgAcceptClientPort + 2  // 服务端的发送的数据块大小，客户端窗口控制参考值
+	msgAcceptReadBuffer  = msgAcceptMSS + 2         // 服务端的接收缓存队列长度，窗口控制初始参考值
 	msgAcceptWriteBuffer = msgAcceptReadBuffer + 4  // 服务端的发送缓存队列长度，窗口控制初始参考值
 	msgAcceptLength      = msgAcceptWriteBuffer + 4 // 消息大小
 )

@@ -267,6 +267,11 @@ func (this *Conn) read(buf []byte) (n int) {
 	return
 }
 
+// 添加数据块
+func (this *Conn) addData(msg *udpData) {
+
+}
+
 // 编码dial消息
 func (this *Conn) dialMsg(msg *udpData) {
 	msg.b[msgType] = msgDial
