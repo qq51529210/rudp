@@ -192,15 +192,6 @@ func (this *RUDP) netOpError(op string, err error) error {
 	}
 }
 
-// 向conn发送udp数据
-func (this *RUDP) writeToConn(msg *udpData, conn *Conn) {
-	n, err := this.conn.WriteToUDP(msg.b[:msg.n], msg.a)
-	if err == nil {
-		this.totalBytes.w += uint64(n)
-		conn.totalBytes.w += uint64(n)
-	}
-}
-
 // Conn发送队列超时重传检查
 func (this *RUDP) checkWriteBuffer(conn *Conn, now time.Time) {
 	conn.wBuf.Lock()

@@ -25,20 +25,21 @@ type readData struct {
 	next *readData // 下一个
 }
 
-// Conn的读缓存
+// Conn的读缓存，是一个队列
 type readBuffer struct {
 	sync.RWMutex           // 锁
-	head         *readData // 数据块队列第一个
-	tail         *readData // 数据块队列最后一个
+	enable       chan int  // 可读标志
+	timeout      time.Time // 应用层设置了读数据的时间，用于"读超时"判断
+	time         time.Time // 上一次接受到有效数据的时间，用于"连接超时"判断
+	head         *readData // 队列第一个，不参与数据计算
 	len          uint32    // 队列当前长度
 	maxLen       uint32    // 队列最大长度
-	enable       chan int  // 可读标志
-	timeout      time.Time // 应用层设置了读超时
-	time         time.Time // 上一次接受到有效数据的时间
+	maxBytes     uint32    // 队列最大字节
 	nextSN       uint32    // 想要的下一个连接数据块的序号，序号前的数据是可读的
-	minSN        uint32    // 当前接受队列最小序号，用于接收到新数据判断
-	maxSN        uint32    // 当前接受队列最大序号，用于接收到新数据判断
-	ackId        uint64    // ack的id，递增，对方用于判断ack消息的buffer最新大小
+	minSN        uint32    // 窗口最小序号
+	maxSN        uint32    // 窗口最大序号
+	mss          uint16    // 对方的数据块大小，用于确定maxLen，在建立连接时确定
+	ackId        uint64    // 对于同一个nextSN的ack，递增的id
 }
 
 // 设置数据块队列的最大长度
@@ -60,88 +61,47 @@ func calcBufferMaxLen(bytes uint32, mss uint16) uint32 {
 // 获取一个数据块
 func (this *readBuffer) getData(sn uint32, data []byte) *readData {
 	// 取头部
-	p := this.pool
-	if p == nil {
-		p = new(readData)
-	} else {
-		this.pool = p.next
-		p.next = nil
-	}
+	p := _readDataPool.Get().(*readData)
 	p.idx = 0
 	p.sn = sn
 	p.buf = p.buf[:0]
 	p.buf = append(p.buf, data...)
+	// 长度+1
+	this.len++
+	// 更新超时时间
+	this.time = time.Now()
 	return p
 }
 
 // 添加数据
-func (this *readBuffer) AddData(msg *udpData) bool {
-	// 数据块序号
-	sn := binary.BigEndian.Uint32(msg.b[msgDataSN:])
-	// 数据块数据
-	data := msg.b[msgDataPayload:msg.n]
-	// 检查
-	this.Lock()
-	// sn超过了接收缓存的最大序列号
-	if sn >= this.maxSN {
-		this.Unlock()
-		return false
+func (this *readBuffer) AddData(sn uint32, data []byte) {
+	// sn在接收缓存范围内
+	if sn < this.nextSN || sn >= this.maxSN {
+		return
 	}
-	// 是新的数据
-	if sn >= conn.rBuf.nextSN {
-		conn.rBuf.Add(sn, msg.b[msgDataPayload:msg.n])
+	prev := this.head
+	p := prev.next
+	for p != nil {
+		// 重复的数据
+		if p.sn == sn {
+			return
+		}
+		// 新的数据
+		if sn < p.sn {
+			d := this.getData(sn, data)
+			d.next = p
+			prev.next = d
+			return
+		}
+		prev = p
+		p = prev.next
 	}
-	// 可读
+	prev.next = this.getData(sn, data)
+	// 如果正好是下一个sn
 	if sn == this.nextSN {
 		this.nextSN++
 		this.ackId = 0
 	}
-	conn.ackMsg(sn, msg)
-	conn.rBuf.Unlock()
-
-	// 第一个数据块
-	if this.data == nil {
-		this.data = this.GetData(sn, buf)
-		this.len++
-		this.time = time.Now()
-		return
-	}
-	p := this.data
-	if p.sn == sn {
-		return
-	}
-	if sn < p.sn {
-		d := this.GetData(sn, buf)
-		d.next = p
-		this.data = d
-		this.len++
-		this.time = time.Now()
-		return
-	}
-	prev := p
-	p = prev.next
-	for p != nil {
-		if p.sn == sn {
-			return
-		}
-		if sn < p.sn {
-			d := this.GetData(sn, buf)
-			d.next = p
-			this.len++
-			this.time = time.Now()
-			return
-		}
-		prev = p
-		p = p.next
-	}
-	prev.next = this.GetData(sn, buf)
-	this.len++
-	this.time = time.Now()
-	return true
-}
-
-func (this *readBuffer) addData(sn uint32, data []byte) {
-
 }
 
 // 写缓存队列node
@@ -157,11 +117,10 @@ type writeData struct {
 type writeBuffer struct {
 	sync.RWMutex               // 锁
 	enable       chan int      // 可写通知
-	pool         *writeData    // 可用的数据块列表
-	data         *writeData    // 等待确认的消息发送队列
+	head         *writeData    // 等待确认的消息发送队列
 	tail         *writeData    // 等待确认的消息发送队列
 	len          uint32        // 数据队列当前长度
-	cap          uint32        // 数据队列最大长度
+	maxLen       uint32        // 数据队列最大长度
 	mss          uint16        // 每一个消息大小，包括消息头
 	sn           uint32        // 当前数据块的最大序号
 	ack          uint32        // 对方ack消息的sn最大序号
@@ -173,11 +132,6 @@ type writeBuffer struct {
 	rttVar       time.Duration // 平均RTT，用于计算RTO
 	minRTO       time.Duration // 最小rto，不要发送"太快"
 	maxRTO       time.Duration // 最大rto，不要出现"假死"
-}
-
-// 发送队列可用的缓存
-func (this *writeBuffer) Left() uint32 {
-	return this.cap - this.len
 }
 
 // 更新ack和对方的free缓存
@@ -209,47 +163,16 @@ func (this *writeBuffer) CalcRTO(data *writeData) {
 	}
 }
 
-// 获取一个数据块
-func (this *writeBuffer) GetData(msg byte, token uint32, buf []byte) *writeData {
-	p := this.pool
-	if p == nil {
-		p = new(writeData)
-	} else {
-		this.pool = p.next
-		p.next = nil
-	}
-	p.sn = this.sn
-	p.first = time.Time{}
-	p.last = time.Time{}
-	// 直接编码data消息
-	p.data.b[msgType] = msg
-	binary.BigEndian.PutUint32(p.data.b[msgDataToken:], token)
-	binary.BigEndian.PutUint32(p.data.b[msgDataSN:], p.sn)
-	p.data.n = copy(p.data.b[msgDataPayload:this.mss], buf)
-	//
-	this.sn++
-	this.len++
-	return p
-}
-
-// 缓存数据块
-func (this *writeBuffer) PutData(p *writeData) {
-	if this.pool != nil {
-		p.next = this.pool
-	}
-	this.pool = p
-}
-
 func (this *writeBuffer) Remove(msg *udpData) {
 	// 检查发送队列
 	this.Lock()
-	if this.data == nil {
+	if this.head == nil {
 		this.Unlock()
 		return
 	}
 	sn := binary.BigEndian.Uint32(msg.b[msgAckSN:])
 	max_sn := binary.BigEndian.Uint32(msg.b[msgAckMaxSN:])
-	p := this.data
+	p := this.head
 	ok := false
 	if max_sn >= sn {
 		// 从发送队列移除小于max_sn的数据块
@@ -266,14 +189,14 @@ func (this *writeBuffer) Remove(msg *udpData) {
 			this.putData(p)
 			p = n
 		}
-		this.data = p
+		this.head = p
 		this.UpdateAck(max_sn, msg)
 		ok = true
 	} else {
 		// 从发送队列移除指定sn的数据块
 		if p.sn == sn {
 			// 链表头
-			this.data = p.next
+			this.head = p.next
 			this.UpdateAck(sn, msg)
 			this.putData(p)
 			ok = true

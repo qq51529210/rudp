@@ -26,35 +26,40 @@ const (
 )
 
 // 创建一个新的Conn变量
-func (this *RUDP) newConn(state connState, rAddr *net.UDPAddr, mss uint16, cs cs) *Conn {
+func (this *RUDP) newConn(cs cs, state connState, rAddr *net.UDPAddr) *Conn {
 	conn := new(Conn)
 	conn.cs = cs
 	conn.state = state
 	conn.rAddr = rAddr
 	conn.lAddr = this.conn.LocalAddr().(*net.UDPAddr)
-	conn.rBuf = newReadBuffer()
-	conn.wBuf = newWriteBuffer(mss)
 	conn.connectSignal = make(chan struct{})
 	conn.closeSignal = make(chan struct{})
+	conn.rBuf.enable = make(chan int, 1)
+	conn.rBuf.head = new(readData)
+	conn.wBuf.enable = make(chan int, 1)
+	conn.wBuf.head = new(writeData)
+	conn.wBuf.mss = DetectMSS(rAddr)
 	return conn
 }
 
 // 保存连接的基本信息，实现可靠性算法
 type Conn struct {
 	lock          sync.RWMutex
+	cs            cs            // 是客户端或者服务端的Conn
 	state         connState     // 状态
-	rBuf          *readBuffer   // 读缓存
-	wBuf          *writeBuffer  // 写缓存
-	dataBytes     rwBytes       // 有效数据总字节
-	totalBytes    rwBytes       // 读写总字节
 	connectSignal chan struct{} // 作为确定连接的信号
 	closeSignal   chan struct{} // 关闭的信号
+	dataBytes     rwBytes       // 有效读写的总字节
+	totalBytes    rwBytes       // 总读写字节
+	rBuf          readBuffer    // 读缓存
+	wBuf          writeBuffer   // 写缓存
 	lAddr         *net.UDPAddr  // 本地地址
 	rAddr         *net.UDPAddr  // 对端地址
 	cToken        uint32        // client连接随机token
 	sToken        uint32        // server连接随机token
-	cs            cs            // 是客户端或者服务端的Conn
-	pingId        uint32        // ping消息的id
+	rReadBuf      uint32        // 对方的读缓存大小，目前没用处
+	rWriteBuf     uint32        // 对方的写缓存大小，目前没用处
+	pingId        uint32        // ping消息的id，递增
 }
 
 // 返回net.OpError
@@ -71,7 +76,7 @@ func (this *Conn) netOpError(op string, err error) error {
 // 设置读缓存大小（字节）
 func (this *Conn) SetReadBuffer(n int) error {
 	this.rBuf.Lock()
-	this.rBuf.cap = uint32(n)
+	this.rBuf.maxLen = calcBufferMaxLen(uint32(n), this.rBuf.mss)
 	this.rBuf.Unlock()
 	return nil
 }
@@ -79,7 +84,7 @@ func (this *Conn) SetReadBuffer(n int) error {
 // 设置写缓存大小（字节）
 func (this *Conn) SetWriteBuffer(n int) error {
 	this.wBuf.Lock()
-	this.wBuf.cap = uint32(n)
+	this.wBuf.maxLen = calcBufferMaxLen(uint32(n), this.wBuf.mss)
 	this.wBuf.Unlock()
 	return nil
 }
@@ -213,75 +218,83 @@ func (this *Conn) SetWriteDeadline(t time.Time) error {
 
 // 写数据
 func (this *Conn) write(buf []byte) (n int) {
+	this.wBuf.Lock()
 	// 还能添加多少数据块
-	m := this.wBuf.Left()
+	m := this.wBuf.maxLen - this.wBuf.len
 	if m < 1 {
+		this.wBuf.Unlock()
 		return
 	}
 	// 没有数据
-	if this.wBuf.data == nil {
-		d := this.wBuf.GetData(msgData[this.cs], this.sToken, buf)
-		// 头
-		this.wBuf.data = d
-		// 尾=头
-		this.wBuf.tail = this.wBuf.data
-		m--
-		n += d.data.n
-		buf = buf[d.data.n:]
-	}
+	p := this.wBuf.head
 	// 循环
 	for m > 0 && len(buf) > 0 {
-		d := this.wBuf.GetData(msgData[this.cs], this.sToken, buf)
+		d := _writeDataPool.Get().(*writeData)
+		// 基本信息
+		d.sn = this.wBuf.sn
+		d.first = time.Time{}
+		d.last = time.Time{}
+		// 直接编码data消息
+		d.data.b[msgType] = msgData[this.cs]
+		binary.BigEndian.PutUint32(p.data.b[msgDataToken:], this.sToken)
+		binary.BigEndian.PutUint32(p.data.b[msgDataSN:], p.sn)
+		d.data.n = copy(p.data.b[msgDataPayload:this.wBuf.mss], buf)
+		// 递增
+		this.wBuf.sn++
+		this.wBuf.len++
 		// 添加到尾部
-		this.wBuf.tail.next = d
-		this.wBuf.tail = this.wBuf.tail.next
+		p.next = d
+		p = p.next
+		// 剩余
 		m--
-		n += d.data.n
 		buf = buf[d.data.n:]
+		// 字节
+		n += d.data.n
 	}
+	this.wBuf.tail = p
+	this.wBuf.Unlock()
 	return
 }
 
 // 读数据
 func (this *Conn) read(buf []byte) (n int) {
-	p := this.rBuf.data
+	p := this.rBuf.head.next
+	this.rBuf.Lock()
 	i := 0
-	// 队列中，小于sn的都是可读的
+	// 小于nextSN的都是可读的
 	for p != nil && p.sn < this.rBuf.nextSN {
-		// 拷贝
+		// 拷贝i个字节
 		i = copy(buf[n:], p.buf[p.idx:])
 		n += i
 		p.idx += i
 		// 数据块读完了，移除，回收
 		if len(p.buf) == p.idx {
-			next := p.next
-			this.rBuf.PutData(p)
-			p = next
+			p = p.next
 			this.rBuf.len--
+			// 窗口移动
+			this.rBuf.minSN++
+			this.rBuf.maxSN++
+			_readDataPool.Put(p)
 		}
 		// 缓存读满了
 		if n == len(buf) {
-			return
+			break
 		}
 	}
+	this.rBuf.head.next = p
+	this.rBuf.Unlock()
 	return
 }
 
-// 添加数据块
-func (this *Conn) addData(msg *udpData) {
-
-}
-
 // 编码dial消息
-func (this *Conn) dialMsg(msg *udpData) {
+func (this *Conn) initMsgDial(msg *udpData) {
 	msg.b[msgType] = msgDial
 	binary.BigEndian.PutUint32(msg.b[msgDialVersion:], msgVersion)
 	copy(msg.b[msgDialLocalIP:], this.lAddr.IP.To16())
 	binary.BigEndian.PutUint16(msg.b[msgDialLocalPort:], uint16(this.lAddr.Port))
-	binary.BigEndian.PutUint32(msg.b[msgDialReadBuffer:], this.rBuf.Left())
-	binary.BigEndian.PutUint32(msg.b[msgDialWriteBuffer:], this.wBuf.Left())
-	msg.n = msgDialLength
-	msg.a = this.rAddr
+	binary.BigEndian.PutUint16(msg.b[msgDialMSS:], this.wBuf.mss)
+	binary.BigEndian.PutUint32(msg.b[msgDialReadBuffer:], this.rBuf.maxLen-this.rBuf.len)
+	binary.BigEndian.PutUint32(msg.b[msgDialWriteBuffer:], this.wBuf.maxLen-this.rBuf.len)
 }
 
 // 编码accept消息
@@ -291,17 +304,10 @@ func (this *Conn) acceptMsg(msg *udpData) {
 	binary.BigEndian.PutUint32(msg.b[msgAcceptSToken:], this.sToken)
 	copy(msg.b[msgAcceptClientIP:], this.rAddr.IP.To16())
 	binary.BigEndian.PutUint16(msg.b[msgAcceptClientPort:], uint16(this.rAddr.Port))
-	binary.BigEndian.PutUint32(msg.b[msgAcceptReadBuffer:], this.rBuf.Left())
-	binary.BigEndian.PutUint32(msg.b[msgAcceptWriteBuffer:], this.wBuf.Left())
+	binary.BigEndian.PutUint16(msg.b[msgAcceptMSS:], this.wBuf.mss)
+	binary.BigEndian.PutUint32(msg.b[msgAcceptReadBuffer:], this.rBuf.maxLen-this.rBuf.len)
+	binary.BigEndian.PutUint32(msg.b[msgAcceptWriteBuffer:], this.wBuf.maxLen-this.rBuf.len)
 	msg.n = msgAckLength
-	msg.a = this.rAddr
-}
-
-// 编码connect消息
-func (this *Conn) connectMsg(msg *udpData) {
-	msg.b[msgType] = msgConnect
-	binary.BigEndian.PutUint32(msg.b[msgConnectToken:], this.sToken)
-	msg.n = msgConnectLength
 	msg.a = this.rAddr
 }
 
@@ -311,18 +317,10 @@ func (this *Conn) ackMsg(sn uint32, msg *udpData) {
 	binary.BigEndian.PutUint32(msg.b[msgAckToken:], this.sToken)
 	binary.BigEndian.PutUint32(msg.b[msgAckSN:], sn)
 	binary.BigEndian.PutUint32(msg.b[msgAckMaxSN:], this.rBuf.nextSN-1)
-	binary.BigEndian.PutUint32(msg.b[msgAckBuffer:], this.rBuf.Left())
+	binary.BigEndian.PutUint32(msg.b[msgAckBuffer:], this.rBuf.maxLen-this.rBuf.len)
 	binary.BigEndian.PutUint64(msg.b[msgAckId:], this.rBuf.ackId)
 	this.rBuf.ackId++
 	msg.n = msgAckLength
-	msg.a = this.rAddr
-}
-
-// 编码close消息
-func (this *Conn) closeMsg(msg *udpData) {
-	msg.b[msgType] = msgClose[this.cs]
-	binary.BigEndian.PutUint32(msg.b[msgCloseToken:], this.sToken)
-	msg.n = msgCloseLength
 	msg.a = this.rAddr
 }
 
@@ -341,7 +339,5 @@ func (this *Conn) pongMsg(msg *udpData, id uint32) {
 	msg.b[msgType] = msgPong
 	binary.BigEndian.PutUint32(msg.b[msgPongToken:], this.sToken)
 	binary.BigEndian.PutUint32(msg.b[msgPongId:], id)
-	binary.BigEndian.PutUint32(msg.b[msgPongBuffer:], this.rBuf.cap-this.rBuf.len)
-	msg.n = msgPongLength
-	msg.a = this.rAddr
+	binary.BigEndian.PutUint32(msg.b[msgPongBuffer:], this.rBuf.maxLen-this.rBuf.len)
 }

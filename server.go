@@ -155,7 +155,7 @@ AccepLoop:
 // 创建一个新的服务端Conn，拆分handleMsgDial()代码
 func (this *RUDP) newAcceptConn(cToken uint32, cAddr *net.UDPAddr) *Conn {
 	// 不存在，第一次收到消息
-	conn := this.newConn(connStateAccept, cAddr, DetectMSS(cAddr), csS)
+	conn := this.newConn(csS, connStateAccept, cAddr)
 	// 产生服务端token
 	conn.cToken = cToken
 	conn.sToken = this.server.token

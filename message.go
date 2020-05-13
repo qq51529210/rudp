@@ -108,6 +108,12 @@ func (this *RUDP) handleMsgDial(msg *udpData) {
 	this.server.accepting[key] = conn
 	this.server.connected[conn.sToken] = conn
 	this.server.Unlock()
+	// 对方的读写缓存
+	conn.rReadBuf = binary.BigEndian.Uint32(msg.b[msgDialReadBuffer:])
+	conn.rWriteBuf = binary.BigEndian.Uint32(msg.b[msgDialWriteBuffer:])
+	// 根据对方的mss来确定接受的队列长度
+	conn.rBuf.mss = binary.BigEndian.Uint16(msg.b[msgDialMSS:])
+	conn.rBuf.maxLen = calcBufferMaxLen(conn.rBuf.maxBytes, conn.rBuf.mss)
 	// 启动服务端Conn写协程
 	go this.acceptConnRoutine(conn, time.Duration(binary.BigEndian.Uint64(msg.b[msgDialTimeout:])))
 }
@@ -153,22 +159,25 @@ func (this *RUDP) handleMsgAccept(msg *udpData) {
 		this.client.Lock()
 		this.client.connected[conn.sToken] = conn
 		this.client.Unlock()
-		// 启动客户端Conn写协程
-		go this.connWriteRoutine(conn)
+		// 对方的读写缓存
+		conn.rReadBuf = binary.BigEndian.Uint32(msg.b[msgAcceptReadBuffer:])
+		conn.rWriteBuf = binary.BigEndian.Uint32(msg.b[msgAcceptWriteBuffer:])
+		// 根据对方的mss来确定接受的队列长度
+		conn.rBuf.mss = binary.BigEndian.Uint16(msg.b[msgAcceptMSS:])
+		conn.rBuf.maxLen = calcBufferMaxLen(conn.rBuf.maxBytes, conn.rBuf.mss)
 		// 通知连接
 		close(conn.connectSignal)
-		// 发送connect消息
-		conn.connectMsg(msg)
-		this.writeToConn(msg, conn)
+		// 启动客户端Conn写协程
+		go this.connWriteRoutine(conn)
 	case connStateConnect:
 		conn.lock.Unlock()
-		// 发送connect消息
-		conn.connectMsg(msg)
-		this.writeToConn(msg, conn)
 	default:
 		// 其他状态不处理
 		conn.lock.Unlock()
+		return
 	}
+	// 发送connect消息
+	this.writeMsgConnect(conn, msg)
 }
 
 // msgRefuse
@@ -252,6 +261,16 @@ func (this *RUDP) handleMsgConnect(msg *udpData) {
 	}
 }
 
+func (this *RUDP) writeMsgConnect(conn *Conn, msg *udpData) {
+	msg.b[msgType] = msgConnect
+	binary.BigEndian.PutUint32(msg.b[msgConnectToken:], conn.sToken)
+	n, err := this.conn.WriteToUDP(msg.b[:msgConnectLength], msg.a)
+	if err == nil {
+		this.totalBytes.w += uint64(n)
+		conn.totalBytes.w += uint64(n)
+	}
+}
+
 // msgData
 const (
 	msgDataToken   = 1                // 连接会话token
@@ -274,10 +293,7 @@ func (this *RUDP) handleMsgDataC(msg *udpData) {
 		this.writeMsgInvalid(msg, msgInvalidS, token)
 		return
 	}
-	// 添加数据
-	if conn.rBuf.Add(msg, conn.cs) {
-		this.writeToConn(msg, conn)
-	}
+	this.handleMsgData(conn, msg)
 }
 
 func (this *RUDP) handleMsgDataS(msg *udpData) {
@@ -291,10 +307,18 @@ func (this *RUDP) handleMsgDataS(msg *udpData) {
 		this.writeMsgInvalid(msg, msgInvalidC, token)
 		return
 	}
-	// 添加数据
-	if conn.rBuf.Add(msg, conn.cs) {
-		this.writeToConn(msg, conn)
-	}
+	this.handleMsgData(conn, msg)
+}
+
+func (this *RUDP) handleMsgData(conn *Conn, msg *udpData) {
+	// 数据块序号
+	sn := binary.BigEndian.Uint32(msg.b[msgDataSN:])
+	conn.rBuf.Lock()
+	conn.rBuf.AddData(sn, msg.b[msgDataPayload:msg.n])
+	// 初始化ack消息
+	conn.ackMsg(sn, msg)
+	conn.rBuf.Unlock()
+	this.writeMsgConnect(conn, msg)
 }
 
 // msgAck
@@ -359,8 +383,7 @@ func (this *RUDP) handleMsgCloseC(msg *udpData) {
 	this.server.RUnlock()
 	if ok {
 		conn.Close()
-		conn.closeMsg(msg)
-		this.writeToConn(msg, conn)
+		this.writeMsgClose(msg, msgClose[conn.cs], token)
 	} else {
 		this.writeMsgInvalid(msg, msgInvalidS, token)
 	}
@@ -376,10 +399,19 @@ func (this *RUDP) handleMsgCloseS(msg *udpData) {
 	this.client.RUnlock()
 	if ok {
 		conn.Close()
-		conn.closeMsg(msg)
-		this.writeToConn(msg, conn)
+		this.writeMsgClose(msg, msgClose[conn.cs], token)
 	} else {
-		this.writeMsgInvalid(msg, msgInvalidC, token)
+		this.writeMsgInvalid(msg, msgInvalidS, token)
+	}
+}
+
+// 编码invalid消息
+func (this *RUDP) writeMsgClose(msg *udpData, _type byte, token uint32) {
+	msg.b[msgType] = _type
+	binary.BigEndian.PutUint32(msg.b[msgCloseToken:], token)
+	n, err := this.WriteTo(msg.b[:msgCloseLength], msg.a)
+	if err == nil {
+		this.totalBytes.w += uint64(n)
 	}
 }
 
@@ -403,7 +435,10 @@ func (this *RUDP) handleMsgPing(msg *udpData) {
 		return
 	}
 	conn.pongMsg(msg, binary.BigEndian.Uint32(msg.b[msgPingId:]))
-	this.writeToConn(msg, conn)
+	n, err := this.WriteTo(msg.b[:msgCloseLength], msg.a)
+	if err == nil {
+		this.totalBytes.w += uint64(n)
+	}
 }
 
 // msgPong

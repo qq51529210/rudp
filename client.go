@@ -1,6 +1,7 @@
 package rudp
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
@@ -41,7 +42,7 @@ func (this *RUDP) Dial(addr string, timeout time.Duration) (*Conn, error) {
 	}
 	// 初始化dial消息
 	msg := _dataPool.Get().(*udpData)
-	conn.dialMsg(msg)
+	conn.initMsgDial(msg)
 	// 超时重发计时器
 	ticker := time.NewTicker(this.client.dialRTO)
 	// 回收资源
@@ -97,7 +98,7 @@ func (this *RUDP) dialConn(addr string) (*Conn, error) {
 		return nil, err
 	}
 	// 探测mss，并初始化Conn
-	conn := this.newConn(connStateDial, rAddr, DetectMSS(rAddr), csC)
+	conn := this.newConn(csC, connStateDial, rAddr)
 	// 产生客户端token
 	this.client.Lock()
 	conn.cToken = this.client.token
