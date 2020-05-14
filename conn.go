@@ -4,62 +4,38 @@ import (
 	"encoding/binary"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-type connState int
-
 // Conn的状态
 const (
-	connStateClose   connState = iota // c<->s，连接超时/被应用层关闭，发送close消息
-	connStateDial                     // c->s，发送dial消息
-	connStateAccept                   // s->c，确认连接，发送accept消息
-	connStateConnect                  // c->s，发送connect消息，双向确认连接
+	connStateClose   uint8 = iota // c<->s，连接超时/被应用层关闭，发送close消息
+	connStateDial                 // c->s，发送dial消息
+	connStateAccept               // s->c，确认连接，发送accept消息
+	connStateConnect              // c->s，发送connect消息，双向确认连接
 )
 
-type cs byte
-
-const (
-	csC cs = 0
-	csS cs = 1
-)
-
-// 创建一个新的Conn变量
-func (this *RUDP) newConn(cs cs, state connState, rAddr *net.UDPAddr) *Conn {
-	conn := new(Conn)
-	conn.cs = cs
-	conn.state = state
-	conn.rAddr = rAddr
-	conn.lAddr = this.conn.LocalAddr().(*net.UDPAddr)
-	conn.connectSignal = make(chan struct{})
-	conn.closeSignal = make(chan struct{})
-	conn.rBuf.enable = make(chan int, 1)
-	conn.rBuf.head = new(readData)
-	conn.wBuf.enable = make(chan int, 1)
-	conn.wBuf.head = new(writeData)
-	conn.wBuf.mss = DetectMSS(rAddr)
-	return conn
-}
-
-// 保存连接的基本信息，实现可靠性算法
 type Conn struct {
-	lock          sync.RWMutex
-	cs            cs            // 是客户端或者服务端的Conn
-	state         connState     // 状态
-	connectSignal chan struct{} // 作为确定连接的信号
-	closeSignal   chan struct{} // 关闭的信号
-	dataBytes     rwBytes       // 有效读写的总字节
-	totalBytes    rwBytes       // 总读写字节
-	rBuf          readBuffer    // 读缓存
-	wBuf          writeBuffer   // 写缓存
-	lAddr         *net.UDPAddr  // 本地地址
-	rAddr         *net.UDPAddr  // 对端地址
-	cToken        uint32        // client连接随机token
-	sToken        uint32        // server连接随机token
-	rReadBuf      uint32        // 对方的读缓存大小，目前没用处
-	rWriteBuf     uint32        // 对方的写缓存大小，目前没用处
-	pingId        uint32        // ping消息的id，递增
+	lock, rLock, wLock sync.RWMutex  // 同步锁，读/写缓存相关数据锁
+	cs                 uint8         // 是客户端，还是服务端的Conn
+	state              uint8         // 状态
+	lNatAddr, rNatAddr *net.UDPAddr  // 本地和对方，udp地址
+	lIntAddr, rIntAddr *net.UDPAddr  // 本地和对方，公网地址
+	ioBytes            uint64RW      // io读写总字节
+	time               time.Time     // 更新的时间
+	closeSignal        chan struct{} // 退出的信号
+	connectSignal      chan struct{} // 作为确定连接的信号
+	rMss, lMss         uint16        // 本地和对方，udp消息大小
+	pingId             uint32        // ping消息的id，递增
+	cToken, sToken     uint32        // 客户端/服务端产生的token
+	lBuff              uint32RW      // 本地读写缓存队列实时容量（字节）
+	lMaxBuff, rMaxBuff uint32RW      // 本地和对方的读写缓存队列最大容量（字节）
+	rto                time.Duration // 超时重发
+	rtt                time.Duration // 实时RTT，用于计算rto
+	rttVar             time.Duration // 平均RTT，用于计算rto
+	rQue               *readData     // 读缓存队列
+	wQue               *writeData    // 写缓存队列
+	rRemains           uint32        // 对方读缓存剩余的长度
 }
 
 // 返回net.OpError
@@ -286,58 +262,29 @@ func (this *Conn) read(buf []byte) (n int) {
 	return
 }
 
-// 编码dial消息
+// 编码msgDial
 func (this *Conn) initMsgDial(msg *udpData) {
-	msg.b[msgType] = msgDial
-	binary.BigEndian.PutUint32(msg.b[msgDialVersion:], msgVersion)
-	copy(msg.b[msgDialLocalIP:], this.lAddr.IP.To16())
-	binary.BigEndian.PutUint16(msg.b[msgDialLocalPort:], uint16(this.lAddr.Port))
-	binary.BigEndian.PutUint16(msg.b[msgDialMSS:], this.wBuf.mss)
-	binary.BigEndian.PutUint32(msg.b[msgDialReadBuffer:], this.rBuf.maxLen-this.rBuf.len)
-	binary.BigEndian.PutUint32(msg.b[msgDialWriteBuffer:], this.wBuf.maxLen-this.rBuf.len)
+	msg.buf[msgType] = msgDial
+	binary.BigEndian.PutUint32(msg.buf[msgDialVersion:], msgVersion)
+	copy(msg.buf[msgDialLocalIP:], this.lAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.buf[msgDialLocalPort:], uint16(this.lAddr.Port))
+	copy(msg.buf[msgDialRemoteIP:], this.rAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.buf[msgDialRemotePort:], uint16(this.rAddr.Port))
+	binary.BigEndian.PutUint16(msg.buf[msgDialMSS:], this.lMss)
+	binary.BigEndian.PutUint32(msg.buf[msgDialReadBuffer:], this.lMaxBuff.r)
+	binary.BigEndian.PutUint32(msg.buf[msgDialWriteBuffer:], this.lMaxBuff.w)
 }
 
-// 编码accept消息
-func (this *Conn) acceptMsg(msg *udpData) {
-	msg.b[msgType] = msgAccept
-	binary.BigEndian.PutUint32(msg.b[msgAcceptCToken:], this.cToken)
-	binary.BigEndian.PutUint32(msg.b[msgAcceptSToken:], this.sToken)
-	copy(msg.b[msgAcceptClientIP:], this.rAddr.IP.To16())
-	binary.BigEndian.PutUint16(msg.b[msgAcceptClientPort:], uint16(this.rAddr.Port))
-	binary.BigEndian.PutUint16(msg.b[msgAcceptMSS:], this.wBuf.mss)
-	binary.BigEndian.PutUint32(msg.b[msgAcceptReadBuffer:], this.rBuf.maxLen-this.rBuf.len)
-	binary.BigEndian.PutUint32(msg.b[msgAcceptWriteBuffer:], this.wBuf.maxLen-this.rBuf.len)
-	msg.n = msgAckLength
-	msg.a = this.rAddr
-}
-
-// 编码ack消息
-func (this *Conn) ackMsg(sn uint32, msg *udpData) {
-	msg.b[msgType] = msgAck[this.cs]
-	binary.BigEndian.PutUint32(msg.b[msgAckToken:], this.sToken)
-	binary.BigEndian.PutUint32(msg.b[msgAckSN:], sn)
-	binary.BigEndian.PutUint32(msg.b[msgAckMaxSN:], this.rBuf.nextSN-1)
-	binary.BigEndian.PutUint32(msg.b[msgAckBuffer:], this.rBuf.maxLen-this.rBuf.len)
-	binary.BigEndian.PutUint64(msg.b[msgAckId:], this.rBuf.ackId)
-	this.rBuf.ackId++
-	msg.n = msgAckLength
-	msg.a = this.rAddr
-}
-
-// 编码ping消息
-func (this *Conn) pingMsg(msg *udpData) {
-	id := atomic.AddUint32(&this.pingId, 1)
-	msg.b[msgType] = msgPing
-	binary.BigEndian.PutUint32(msg.b[msgPingToken:], this.sToken)
-	binary.BigEndian.PutUint32(msg.b[msgPingId:], id)
-	msg.n = msgPingLength
-	msg.a = this.rAddr
-}
-
-// 编码pong消息
-func (this *Conn) pongMsg(msg *udpData, id uint32) {
-	msg.b[msgType] = msgPong
-	binary.BigEndian.PutUint32(msg.b[msgPongToken:], this.sToken)
-	binary.BigEndian.PutUint32(msg.b[msgPongId:], id)
-	binary.BigEndian.PutUint32(msg.b[msgPongBuffer:], this.rBuf.maxLen-this.rBuf.len)
+// 编码msgAccept
+func (this *Conn) initMsgAccept(msg *udpData) {
+	msg.buf[msgType] = msgAccept
+	binary.BigEndian.PutUint32(msg.buf[msgAcceptCToken:], this.cToken)
+	binary.BigEndian.PutUint32(msg.buf[msgAcceptSToken:], this.sToken)
+	copy(msg.buf[msgAcceptLocalIP:], this.lAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.buf[msgAcceptLocalPort:], uint16(this.lAddr.Port))
+	copy(msg.buf[msgAcceptRemoteIP:], this.rAddr.IP.To16())
+	binary.BigEndian.PutUint16(msg.buf[msgAcceptRemotePort:], uint16(this.rAddr.Port))
+	binary.BigEndian.PutUint16(msg.buf[msgAcceptMSS:], this.lMss)
+	binary.BigEndian.PutUint32(msg.buf[msgAcceptReadBuffer:], this.lMaxBuff.r)
+	binary.BigEndian.PutUint32(msg.buf[msgAcceptWriteBuffer:], this.lMaxBuff.w)
 }
