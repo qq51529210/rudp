@@ -64,50 +64,49 @@ const (
 
 // msgConnect字段下标
 const (
-	msgConnectCToken = 1                    // 客户端token
-	msgConnectSToken = msgConnectCToken + 4 // 服务端token
+	msgConnectCToken = msgCToken // 客户端token
+	msgConnectSToken = msgSToken // 服务端token
 	msgConnectLength = msgConnectSToken + 4
 )
 
 // msgData字段下标
 const (
-	msgDataCToken  = 1                 // 客户端token
-	msgDataSToken  = msgDataCToken + 4 // 服务端token
+	msgDataCToken  = msgCToken         // 客户端token
+	msgDataSToken  = msgSToken         // 服务端token
 	msgDataSN      = msgDataSToken + 4 // 数据包的序号
 	msgDataPayload = msgDataSN + 4
 )
 
 // msgAck字段下标
 const (
-	msgAckCToken  = 1                 // 客户端token
-	msgAckSToken  = msgAckCToken + 4  // 服务端token
+	msgAckCToken  = msgCToken         // 客户端token
+	msgAckSToken  = msgSToken         // 服务端token
 	msgAckSN      = msgAckSToken + 4  // 数据包的序号
 	msgAckMaxSN   = msgAckSN + 4      // 连续数据包的序号
 	msgAckRemains = msgAckMaxSN + 4   // 剩余的接受缓存容量长度
 	msgAckId      = msgAckRemains + 4 // ack的序号，用于判断，同一个sn，
-	msgAckLength  = msgAckId + 8
+	msgAckLength  = msgAckId + 4
 )
 
 // msgClose字段下标
 const (
-	msgCloseCToken = 1                  // 客户端token
-	msgCloseSToken = msgCloseCToken + 4 // 服务端token
-	msgCloseState  = msgCloseSToken + 4 // 关闭连接的状态
-	msgCloseLength = msgCloseState + 1
+	msgCloseCToken = msgCToken // 客户端token
+	msgCloseSToken = msgSToken // 服务端token
+	msgCloseLength = msgCloseSToken + 4
 )
 
 // msgPing字段下标
 const (
-	msgPingCToken = 1                 // 客户端token
-	msgPingSToken = msgPingCToken + 4 // 服务端token
+	msgPingCToken = msgCToken         // 客户端token
+	msgPingSToken = msgSToken         // 服务端token
 	msgPingId     = msgPingSToken + 4 // 每一个ping消息的id，递增
 	msgPingLength = msgPingId + 4
 )
 
 // msgPong字段下标
 const (
-	msgPongCToken  = 1                 // 客户端token
-	msgPongSToken  = msgPongCToken + 4 // 服务端token
+	msgPongCToken  = msgCToken         // 客户端token
+	msgPongSToken  = msgSToken         // 服务端token
 	msgPongPingId  = msgPongSToken + 4 // ping传过来的id
 	msgPongSN      = msgPongPingId + 4 // 连续数据包的序号
 	msgPongRemains = msgPongSN + 4     // 剩余的接受缓存容量长度
@@ -116,13 +115,22 @@ const (
 
 // msgInvalid字段下标
 const (
-	msgInvalidCToken = 1                    // 客户端token
-	msgInvalidSToken = msgInvalidCToken + 4 // 服务端token
+	msgInvalidCToken = msgCToken // 客户端token
+	msgInvalidSToken = msgSToken // 服务端token
 	msgInvalidLength = msgInvalidSToken + 4
 )
 
 const (
-	msgType    = 0      // 消息类型下标
-	msgVersion = 1      // 消息的版本，不同的版本可能字段不一样
-	msgBuffLen = maxMSS // 消息缓存大小，udpData中使用
+	msgVersion = 1             // 消息的版本，不同的版本可能字段不一样
+	msgBuffLen = maxMSS        // 消息缓存大小，udpData中使用
+	msgType    = 0             // 消息类型下标
+	msgCToken  = 1             // 连接后的客户端token下标
+	msgSToken  = msgCToken + 4 // 连接后的服务端token下标
+)
+
+var (
+	msgData    = []byte{msgDataC, msgDataS}
+	msgAck     = []byte{msgAckC, msgAckS}
+	msgClose   = []byte{msgCloseC, msgCloseS}
+	msgInvalid = []byte{msgInvalidC, msgInvalidS}
 )

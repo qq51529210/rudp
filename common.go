@@ -124,6 +124,12 @@ type udpData struct {
 	addr *net.UDPAddr     // udp地址
 }
 
+func (this *udpData) InitConnKey(key *connKey) {
+	key.Init(this.addr)
+	key.cToken = binary.BigEndian.Uint32(this.buf[msgCToken:])
+	key.sToken = binary.BigEndian.Uint32(this.buf[msgSToken:])
+}
+
 // udp数据包的缓存池
 var udpDataPool sync.Pool
 
