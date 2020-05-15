@@ -27,32 +27,32 @@ const (
 
 // msgDial字段下标
 const (
-	msgDialVersion     = 1                      // 版本号
-	msgDialToken       = msgDialVersion + 4     // 随机token
-	msgDialLocalIP     = msgDialToken + 4       // 本地监听ip
-	msgDialLocalPort   = msgDialLocalIP + 16    // 本地监听端口
-	msgDialRemoteIP    = msgDialLocalPort + 4   // 对方公网ip
-	msgDialRemotePort  = msgDialRemoteIP + 16   // 对方公网端口
-	msgDialMSS         = msgDialRemotePort + 2  // udp数据包大小，窗口控制参考值
-	msgDialReadBuffer  = msgDialMSS + 2         // 接收缓存大小（字节），窗口控制参考值
-	msgDialWriteBuffer = msgDialReadBuffer + 4  // 发送缓存大小（字节），窗口控制参考值
-	msgDialTimeout     = msgDialWriteBuffer + 4 // Dial函数的连接超时
-	msgDialLength      = msgDialTimeout + 8
+	msgDialVersion    = 1                     // 版本号
+	msgDialToken      = msgDialVersion + 4    // 随机token
+	msgDialLocalIP    = msgDialToken + 4      // 本地监听ip
+	msgDialLocalPort  = msgDialLocalIP + 16   // 本地监听端口
+	msgDialRemoteIP   = msgDialLocalPort + 4  // 对方公网ip
+	msgDialRemotePort = msgDialRemoteIP + 16  // 对方公网端口
+	msgDialMSS        = msgDialRemotePort + 2 // udp数据包大小，窗口控制参考值
+	msgDialReadQueue  = msgDialMSS + 2        // 接收队列（窗口）大小，窗口控制参考值
+	msgDialWriteQueue = msgDialReadQueue + 4  // 发送队列（窗口）大小，窗口控制参考值
+	msgDialTimeout    = msgDialWriteQueue + 4 // Dial函数的连接超时
+	msgDialLength     = msgDialTimeout + 8
 )
 
 // msgAccept字段下标
 const (
-	msgAcceptVersion     = 1                       // 版本号
-	msgAcceptCToken      = msgAcceptVersion + 4    // 客户端token
-	msgAcceptSToken      = msgAcceptCToken + 4     // 服务端token
-	msgAcceptLocalIP     = msgAcceptSToken + 4     // 本地监听ip
-	msgAcceptLocalPort   = msgAcceptLocalIP + 16   // 本地监听端口
-	msgAcceptRemoteIP    = msgAcceptLocalPort + 4  // 对方公网ip
-	msgAcceptRemotePort  = msgAcceptRemoteIP + 16  // 对方公网端口
-	msgAcceptMSS         = msgAcceptRemotePort + 2 // udp数据包大小，窗口控制参考值
-	msgAcceptReadBuffer  = msgAcceptMSS + 2        // 接收缓存大小（字节），窗口控制参考值
-	msgAcceptWriteBuffer = msgAcceptReadBuffer + 4 // 发送缓存大小（字节），窗口控制参考值
-	msgAcceptLength      = msgAcceptWriteBuffer + 4
+	msgAcceptVersion    = 1                       // 版本号
+	msgAcceptCToken     = msgAcceptVersion + 4    // 客户端token
+	msgAcceptSToken     = msgAcceptCToken + 4     // 服务端token
+	msgAcceptLocalIP    = msgAcceptSToken + 4     // 本地监听ip
+	msgAcceptLocalPort  = msgAcceptLocalIP + 16   // 本地监听端口
+	msgAcceptRemoteIP   = msgAcceptLocalPort + 4  // 对方公网ip
+	msgAcceptRemotePort = msgAcceptRemoteIP + 16  // 对方公网端口
+	msgAcceptMSS        = msgAcceptRemotePort + 2 // udp数据包大小，窗口控制参考值
+	msgAcceptReadQueue  = msgAcceptMSS + 2        // 接收队列（窗口）大小，窗口控制参考值
+	msgAcceptWriteQueue = msgAcceptReadQueue + 4  // 发送队列（窗口）大小，窗口控制参考值
+	msgAcceptLength     = msgAcceptWriteQueue + 4
 )
 
 // msgRefuse字段下标
