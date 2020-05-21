@@ -1,5 +1,16 @@
 package rudp
 
+// ip传输包的参数
+const (
+	ipV4Header = 20                              // IPv4数据包头大小
+	ipV6Header = 40                              // IPv6数据包头大小
+	udpHeader  = 8                               // UDP数据包头大小
+	minMTU     = 576                             // 链路最小的MTU
+	maxMTU     = 1500                            // 链路最大的MTU
+	minMSS     = minMTU - ipV6Header - udpHeader // 应用层最小数据包
+	maxMSS     = maxMTU - ipV4Header - udpHeader // 应用层最大数据包
+)
+
 // 消息类型定义
 // 为什么Data/Ack/Close要区分cs
 // RUDP是一个双向的（可作为c也可作为s），一对多的Conn
@@ -15,21 +26,35 @@ const (
 	msgConnect         // c->s，收到接受连接的消息，握手3
 	msgPing            // c->s，ping
 	msgPong            // s->c，pong
-	msgDataC           // c->s，数据
-	msgDataS           // s->c，数据
+	msgDataC           // c->s，数据，大小为0表示关闭连接
+	msgDataS           // s->c，数据，大小为0表示关闭连接
 	msgAckC            // c->s，确认数据
 	msgAckS            // s->c，确认数据
-	msgCloseC          // c->s，关闭
-	msgCloseS          // s->c，关闭
 	msgInvalidC        // c->s，无效连接
 	msgInvalidS        // s->c，无效连接
 )
 
+const (
+	msgVersion = 1             // 消息的版本，不同的版本可能字段不一样
+	msgBuffLen = maxMSS        // 消息缓存大小，udpData中使用
+	msgType    = 0             // 消息类型下标
+	msgCToken  = msgType + 1   // 消息客户端token下标
+	msgSToken  = msgCToken + 4 // 消息服务端token下标
+	msgSN      = msgSToken + 4 // 消息sn下标
+	msgPayload = msgSN + 4     // 消息数据起始下标
+)
+
+var (
+	msgData    = []byte{msgDataC, msgDataS}
+	msgAck     = []byte{msgAckC, msgAckS}
+	msgInvalid = []byte{msgInvalidC, msgInvalidS}
+)
+
 // msgDial字段下标
 const (
-	msgDialVersion    = 1                     // 版本号
-	msgDialToken      = msgDialVersion + 4    // 随机token
-	msgDialLocalIP    = msgDialToken + 4      // 本地监听ip
+	msgDialToken      = msgType + 1           // 版本号
+	msgDialVersion    = msgDialToken + 4      // 随机token
+	msgDialLocalIP    = msgDialVersion + 4    // 本地监听ip
 	msgDialLocalPort  = msgDialLocalIP + 16   // 本地监听端口
 	msgDialRemoteIP   = msgDialLocalPort + 4  // 对方公网ip
 	msgDialRemotePort = msgDialRemoteIP + 16  // 对方公网端口
@@ -42,10 +67,10 @@ const (
 
 // msgAccept字段下标
 const (
-	msgAcceptVersion    = 1                       // 版本号
-	msgAcceptCToken     = msgAcceptVersion + 4    // 客户端token
-	msgAcceptSToken     = msgAcceptCToken + 4     // 服务端token
-	msgAcceptLocalIP    = msgAcceptSToken + 4     // 本地监听ip
+	msgAcceptCToken     = msgType + 1             // 版本号
+	msgAcceptSToken     = msgAcceptCToken + 4     // 客户端token
+	msgAcceptVersion    = msgAcceptSToken + 4     // 服务端token
+	msgAcceptLocalIP    = msgAcceptVersion + 4    // 本地监听ip
 	msgAcceptLocalPort  = msgAcceptLocalIP + 16   // 本地监听端口
 	msgAcceptRemoteIP   = msgAcceptLocalPort + 4  // 对方公网ip
 	msgAcceptRemotePort = msgAcceptRemoteIP + 16  // 对方公网端口
@@ -57,56 +82,48 @@ const (
 
 // msgRefuse字段下标
 const (
-	msgRefuseVersion = 1                    // 版本号
-	msgRefuseToken   = msgRefuseVersion + 4 // 客户端token
-	msgRefuseLength  = msgRefuseToken + 4
+	msgRefuseToken   = msgType + 1        // 版本号
+	msgRefuseVersion = msgRefuseToken + 4 // 客户端token
+	msgRefuseLength  = msgRefuseVersion + 4
 )
 
 // msgConnect字段下标
 const (
-	msgConnectCToken = msgCToken // 客户端token
-	msgConnectSToken = msgSToken // 服务端token
-	msgConnectLength = msgConnectSToken + 4
+	msgConnectToken  = msgType + 1 // 连接token
+	msgConnectLength = msgConnectToken + 4
 )
 
 // msgData字段下标
 const (
-	msgDataCToken  = msgCToken         // 客户端token
-	msgDataSToken  = msgSToken         // 服务端token
+	msgDataCToken  = msgType + 1       // 客户端token
+	msgDataSToken  = msgDataCToken + 4 // 服务端token
 	msgDataSN      = msgDataSToken + 4 // 数据包的序号
 	msgDataPayload = msgDataSN + 4
 )
 
 // msgAck字段下标
 const (
-	msgAckCToken  = msgCToken         // 客户端token
-	msgAckSToken  = msgSToken         // 服务端token
+	msgAckCToken  = msgType + 1       // 客户端token
+	msgAckSToken  = msgAckCToken + 4  // 服务端token
 	msgAckSN      = msgAckSToken + 4  // 数据包的序号
 	msgAckMaxSN   = msgAckSN + 4      // 连续数据包的序号
 	msgAckRemains = msgAckMaxSN + 4   // 剩余的接受缓存容量长度
-	msgAckId      = msgAckRemains + 4 // ack的序号，用于判断，同一个sn，
-	msgAckLength  = msgAckId + 4
-)
-
-// msgClose字段下标
-const (
-	msgCloseCToken = msgCToken // 客户端token
-	msgCloseSToken = msgSToken // 服务端token
-	msgCloseLength = msgCloseSToken + 4
+	msgAckTime    = msgAckRemains + 4 // ack的时间，
+	msgAckLength  = msgAckTime + 8
 )
 
 // msgPing字段下标
 const (
-	msgPingCToken = msgCToken         // 客户端token
-	msgPingSToken = msgSToken         // 服务端token
+	msgPingCToken = msgType + 1       // 客户端token
+	msgPingSToken = msgPingCToken + 4 // 服务端token
 	msgPingId     = msgPingSToken + 4 // 每一个ping消息的id，递增
 	msgPingLength = msgPingId + 4
 )
 
 // msgPong字段下标
 const (
-	msgPongCToken  = msgCToken         // 客户端token
-	msgPongSToken  = msgSToken         // 服务端token
+	msgPongCToken  = msgType + 1       // 客户端token
+	msgPongSToken  = msgPongCToken + 4 // 服务端token
 	msgPongPingId  = msgPongSToken + 4 // ping传过来的id
 	msgPongSN      = msgPongPingId + 4 // 连续数据包的序号
 	msgPongRemains = msgPongSN + 4     // 剩余的接受缓存容量长度
@@ -115,22 +132,6 @@ const (
 
 // msgInvalid字段下标
 const (
-	msgInvalidCToken = msgCToken // 客户端token
-	msgInvalidSToken = msgSToken // 服务端token
-	msgInvalidLength = msgInvalidSToken + 4
-)
-
-const (
-	msgVersion = 1             // 消息的版本，不同的版本可能字段不一样
-	msgBuffLen = maxMSS        // 消息缓存大小，udpData中使用
-	msgType    = 0             // 消息类型下标
-	msgCToken  = 1             // 连接后的客户端token下标
-	msgSToken  = msgCToken + 4 // 连接后的服务端token下标
-)
-
-var (
-	msgData    = []byte{msgDataC, msgDataS}
-	msgAck     = []byte{msgAckC, msgAckS}
-	msgClose   = []byte{msgCloseC, msgCloseS}
-	msgInvalid = []byte{msgInvalidC, msgInvalidS}
+	msgInvalidToken  = msgType + 1 // token
+	msgInvalidLength = msgInvalidToken + 4
 )
