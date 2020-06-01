@@ -44,9 +44,16 @@ func init() {
 // 是客户端还是服务端的Conn
 type connCS uint8
 
+func (this connCS) String() string {
+	if this == connClient {
+		return "client"
+	}
+	return "server"
+}
+
 const (
-	clientConn connCS = 0
-	serverConn connCS = 1
+	connClient connCS = 0
+	connServer connCS = 1
 )
 
 // Conn的状态
@@ -57,7 +64,6 @@ const (
 	connStateDial                     // 客户端发起连接
 	connStateAccept                   // 服务端收到连接请求，等待客户端确认
 	connStateConnect                  // cs，client和server双向确认连接
-	connStateClosing                  // 正在关闭，但是读（被关闭）缓存还有数据没有传输完成
 )
 
 type Conn struct {
@@ -413,15 +419,16 @@ func (this *Conn) writeEOF() {
 }
 
 // 从队列中移除小于sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteDataBefore(sn, remains uint32) {
+func (this *Conn) rmWriteDataBefore(sn, remains uint32) bool {
 	// 检查sn是否在发送窗口范围
-	if this.writeQueueTail != this.writeQueueHead && this.writeQueueTail.sn < sn {
-		return
+	if this.writeQueueTail != this.writeQueueHead &&
+		this.writeQueueTail.sn < sn {
+		return false
 	}
 	// 遍历发送队列数据包
 	cur := this.writeQueueHead.next
 	if cur != nil && cur.sn > sn {
-		return
+		return false
 	}
 	now := time.Now()
 	for {
@@ -441,20 +448,16 @@ func (this *Conn) rmWriteDataBefore(sn, remains uint32) {
 	}
 	this.writeQueueHead.next = cur
 	this.writeQueueTail = this.writeQueueHead
-	// 可写通知
-	select {
-	case this.writeable <- 1:
-	default:
-	}
 	this.writeMax = remains
+	return true
 }
 
 // 从队列中移除指定sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteData(sn, remains uint32) {
+func (this *Conn) rmWriteData(sn, remains uint32) bool {
 	// 检查sn是否在发送窗口范围
 	if this.writeQueueTail != this.writeQueueHead &&
 		this.writeQueueTail.sn < sn {
-		return
+		return false
 	}
 	// 遍历发送队列数据包
 	prev := this.writeQueueHead
@@ -462,7 +465,7 @@ func (this *Conn) rmWriteData(sn, remains uint32) {
 	for cur != nil {
 		// 因为是递增有序队列，sn如果小于当前，就没必要继续
 		if sn < cur.sn {
-			return
+			return false
 		}
 		if sn == cur.sn {
 			// rto
@@ -474,17 +477,13 @@ func (this *Conn) rmWriteData(sn, remains uint32) {
 			}
 			writeDataPool.Put(cur)
 			this.writeQueueLen--
-			// 可写通知
-			select {
-			case this.writeable <- 1:
-			default:
-			}
 			this.writeMax = remains
-			return
+			return true
 		}
 		prev = cur
 		cur = prev.next
 	}
+	return false
 }
 
 // 移除第一个数据包

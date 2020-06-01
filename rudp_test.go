@@ -36,7 +36,7 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 				}
 			}
 			t.Log(string(buf[:n]))
-			n, err = conn.Write(buf[:n])
+			n, err = conn.Write([]byte("server say hello"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -50,7 +50,7 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Log("conn from", conn.RemoteAddr())
-		_, err = conn.Write([]byte("hello"))
+		_, err = conn.Write([]byte("client say hello"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,4 +65,23 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 	wait.Wait()
 	server.Close()
 	client.Close()
+}
+
+func Test_RUDP_Close(t *testing.T) {
+	rudp, err := New("127.0.0.1:10000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := sync.WaitGroup{}
+	n := 1000
+	for i := 0; i < 5; i++ {
+		w.Add(1)
+		go func() {
+			for i := 0; i < n; i++ {
+				rudp.Close()
+			}
+			w.Done()
+		}()
+	}
+	w.Wait()
 }

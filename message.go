@@ -24,14 +24,14 @@ const (
 	msgAccept          // s->c，接受连接，握手2
 	msgRefuse          // s->c，拒绝连接，握手2
 	msgConnect         // c->s，收到接受连接的消息，握手3
-	msgPing            // c->s，ping
-	msgPong            // s->c，pong
 	msgDataC           // c->s，数据，大小为0表示关闭连接
 	msgDataS           // s->c，数据，大小为0表示关闭连接
 	msgAckC            // c->s，确认数据
 	msgAckS            // s->c，确认数据
 	msgInvalidC        // c->s，无效连接
 	msgInvalidS        // s->c，无效连接
+	msgPing            // c->s，ping
+	msgPong            // s->c，pong
 )
 
 const (
@@ -103,6 +103,12 @@ const (
 	msgAckLength  = msgAckRemains + 8
 )
 
+// msgInvalid字段下标
+const (
+	msgInvalidToken  = msgType + 1 // token
+	msgInvalidLength = msgInvalidToken + 4
+)
+
 // msgPing字段下标
 const (
 	msgPingToken  = msgType + 1      // 连接token
@@ -117,10 +123,4 @@ const (
 	msgPongMaxSN   = msgPongPingId + 4 // 连续数据包的序号
 	msgPongRemains = msgPongMaxSN + 4  // 剩余的接受缓存容量长度
 	msgPongLength  = msgPongRemains + 4
-)
-
-// msgInvalid字段下标
-const (
-	msgInvalidToken  = msgType + 1 // token
-	msgInvalidLength = msgInvalidToken + 4
 )
