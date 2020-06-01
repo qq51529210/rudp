@@ -125,17 +125,20 @@ func (this *Conn) Read(b []byte) (int, error) {
 	if this.readTimeout.IsZero() {
 		this.readLock.RUnlock()
 		for {
-			select {
-			case <-this.readable:
-				n := this.read(b)
-				if n > 0 {
-					return n, nil
+			n := this.read(b)
+			if n == 0 {
+				select {
+				case <-this.readable:
+					continue
+				case <-this.closed:
+					return 0, this.netOpError("read", closeErr("conn"))
 				}
-				if n < 0 {
-					return 0, io.EOF
-				}
-			case <-this.closed:
-				return 0, this.netOpError("read", closeErr("conn"))
+			}
+			if n > 0 {
+				return n, nil
+			}
+			if n < 0 {
+				return 0, io.EOF
 			}
 		}
 	}
@@ -146,19 +149,16 @@ func (this *Conn) Read(b []byte) (int, error) {
 		return 0, this.netOpError("read", opErr("timeout"))
 	}
 	for {
-		select {
-		case <-this.readable:
-			n := this.read(b)
-			if n > 0 {
-				return n, nil
+		n := this.read(b)
+		if n == 0 {
+			select {
+			case <-this.readable:
+				continue
+			case <-this.closed:
+				return 0, this.netOpError("read", closeErr("conn"))
+			case <-time.After(duration):
+				return 0, this.netOpError("read", opErr("timeout"))
 			}
-			if n < 0 {
-				return 0, io.EOF
-			}
-		case <-this.closed:
-			return 0, this.netOpError("read", closeErr("conn"))
-		case <-time.After(duration):
-			return 0, this.netOpError("read", opErr("timeout"))
 		}
 	}
 }
@@ -175,15 +175,18 @@ func (this *Conn) Write(b []byte) (int, error) {
 	if this.writeTimeout.IsZero() {
 		this.writeLock.RUnlock()
 		for {
-			select {
-			case <-this.writeable:
-				n := this.write(b[m:])
-				m += n
-				if m == len(b) {
-					return n, nil
+			n := this.write(b[m:])
+			if n == 0 {
+				select {
+				case <-this.writeable:
+					continue
+				case <-this.closed:
+					return 0, this.netOpError("write", closeErr("conn"))
 				}
-			case <-this.closed:
-				return 0, this.netOpError("write", closeErr("conn"))
+			}
+			m += n
+			if m == len(b) {
+				return n, nil
 			}
 		}
 	}
@@ -194,17 +197,20 @@ func (this *Conn) Write(b []byte) (int, error) {
 		return 0, this.netOpError("write", opErr("timeout"))
 	}
 	for {
-		select {
-		case <-this.writeable:
-			n := this.write(b[m:])
-			m += n
-			if m == len(b) {
-				return n, nil
+		n := this.write(b[m:])
+		if n == 0 {
+			select {
+			case <-this.writeable:
+				continue
+			case <-this.closed:
+				return 0, this.netOpError("write", closeErr("conn"))
+			case <-time.After(duration):
+				return 0, this.netOpError("write", opErr("timeout"))
 			}
-		case <-this.closed:
-			return 0, this.netOpError("write", closeErr("conn"))
-		case <-time.After(duration):
-			return 0, this.netOpError("write", opErr("timeout"))
+		}
+		m += n
+		if m == len(b) {
+			return n, nil
 		}
 	}
 }
@@ -220,7 +226,7 @@ func (this *Conn) Close() error {
 	this.state = connStateClose
 	this.lock.Unlock()
 	// 发送一个空数据
-	this.write(emptyData)
+	this.writeEOF()
 	return nil
 }
 
@@ -407,25 +413,31 @@ func (this *Conn) writeEOF() {
 }
 
 // 从队列中移除小于sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteDataBefore(sn uint32) {
+func (this *Conn) rmWriteDataBefore(sn, remains uint32) {
 	// 检查sn是否在发送窗口范围
-	if this.writeQueueTail != this.writeQueueHead &&
-		this.writeQueueTail.sn < sn {
+	if this.writeQueueTail != this.writeQueueHead && this.writeQueueTail.sn < sn {
+		return
+	}
+	// 遍历发送队列数据包
+	cur := this.writeQueueHead.next
+	if cur != nil && cur.sn > sn {
 		return
 	}
 	now := time.Now()
-	// 遍历发送队列数据包
-	cur := this.writeQueueHead.next
-	for cur != nil {
-		if cur.sn > sn {
-			return
+	for {
+		if cur != nil {
+			if cur.sn > sn {
+				break
+			}
+			// rto
+			this.calcRTO(now.Sub(cur.first))
+			next := cur.next
+			writeDataPool.Put(cur)
+			cur = next
+			this.writeQueueLen--
+		} else {
+			break
 		}
-		// rto
-		this.calcRTO(now.Sub(cur.first))
-		next := cur.next
-		writeDataPool.Put(cur)
-		cur = next
-		this.writeQueueLen--
 	}
 	this.writeQueueHead.next = cur
 	this.writeQueueTail = this.writeQueueHead
@@ -434,10 +446,11 @@ func (this *Conn) rmWriteDataBefore(sn uint32) {
 	case this.writeable <- 1:
 	default:
 	}
+	this.writeMax = remains
 }
 
 // 从队列中移除指定sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteData(sn uint32) {
+func (this *Conn) rmWriteData(sn, remains uint32) {
 	// 检查sn是否在发送窗口范围
 	if this.writeQueueTail != this.writeQueueHead &&
 		this.writeQueueTail.sn < sn {
@@ -466,6 +479,7 @@ func (this *Conn) rmWriteData(sn uint32) {
 			case this.writeable <- 1:
 			default:
 			}
+			this.writeMax = remains
 			return
 		}
 		prev = cur
@@ -615,8 +629,12 @@ func (this *Conn) writeMsgConnect(buf []byte) {
 	binary.BigEndian.PutUint32(buf[msgConnectToken:], this.sToken)
 }
 
-func (this *Conn) writeMsgAck(buf []byte) {
-
+func (this *Conn) writeMsgAck(buf []byte, sn uint32) {
+	buf[msgType] = msgAck[this.cs]
+	binary.BigEndian.PutUint32(buf[msgAckToken:], this.sToken)
+	binary.BigEndian.PutUint32(buf[msgAckSN:], sn)
+	binary.BigEndian.PutUint32(buf[msgAckMaxSN:], this.readNextSN)
+	binary.BigEndian.PutUint32(buf[msgAckRemains:], this.readQueueMaxLen-this.readQueueLen)
 }
 
 func (this *Conn) readMsgPong(buf []byte) {
@@ -627,11 +645,12 @@ func (this *Conn) readMsgPong(buf []byte) {
 		return
 	}
 	this.pingId++
+	this.readTime = time.Now()
 	this.readLock.Unlock()
 
 	this.writeLock.Lock()
-	this.rmWriteDataBefore(binary.BigEndian.Uint32(buf[msgPongMaxSN:]))
-	this.writeMax = binary.BigEndian.Uint32(buf[msgPongRemains:])
+	this.rmWriteDataBefore(binary.BigEndian.Uint32(buf[msgPongMaxSN:]),
+		binary.BigEndian.Uint32(buf[msgPongRemains:]))
 	this.writeLock.Unlock()
 }
 

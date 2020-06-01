@@ -26,15 +26,19 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 		}
 		t.Log("conn from", conn.RemoteAddr())
 		var buf udpBuf
-		n, err := conn.Read(buf[:])
-		if err != nil {
-			if err != io.EOF {
-				t.Fatal(err)
+		for {
+			n, err := conn.Read(buf[:])
+			if err != nil {
+				if err != io.EOF {
+					t.Fatal(err)
+				} else {
+					break
+				}
+			} else {
+				t.Log(string(buf[:n]))
 			}
-			conn.Close()
-		} else {
-			t.Log(string(buf[:n]))
 		}
+		conn.Close()
 	}()
 	go func() {
 		defer wait.Done()
