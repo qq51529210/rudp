@@ -34,8 +34,11 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 				} else {
 					break
 				}
-			} else {
-				t.Log(string(buf[:n]))
+			}
+			t.Log(string(buf[:n]))
+			n, err = conn.Write(buf[:n])
+			if err != nil {
+				t.Fatal(err)
 			}
 		}
 		conn.Close()
@@ -51,6 +54,12 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		var buf udpBuf
+		n, err := conn.Read(buf[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Log(string(buf[:n]))
 		conn.Close()
 	}()
 	wait.Wait()

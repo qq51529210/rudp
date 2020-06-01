@@ -633,7 +633,7 @@ func (this *Conn) writeMsgAck(buf []byte, sn uint32) {
 	buf[msgType] = msgAck[this.cs]
 	binary.BigEndian.PutUint32(buf[msgAckToken:], this.sToken)
 	binary.BigEndian.PutUint32(buf[msgAckSN:], sn)
-	binary.BigEndian.PutUint32(buf[msgAckMaxSN:], this.readNextSN)
+	binary.BigEndian.PutUint32(buf[msgAckMaxSN:], this.readNextSN-1)
 	binary.BigEndian.PutUint32(buf[msgAckRemains:], this.readQueueMaxLen-this.readQueueLen)
 }
 
