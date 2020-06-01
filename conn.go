@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Conn读队列数据包
+// Conn接收队列数据包
 type readData struct {
 	sn   uint32    // 序号
 	buf  []byte    // 数据
@@ -17,7 +17,7 @@ type readData struct {
 	next *readData // 下一个
 }
 
-// Conn写队列数据包
+// Conn发送队列数据包
 type writeData struct {
 	sn    uint32       // 序号
 	buf   [maxMSS]byte // 数据
@@ -41,56 +41,66 @@ func init() {
 	}
 }
 
-// Conn的状态
+// 是客户端还是服务端的Conn
+type connCS uint8
+
 const (
-	connStateClose   = iota // 连接超时/被应用层关闭
-	connStateDial           // 客户端发起连接
-	connStateAccept         // 服务端收到连接请求，等待客户端确认
-	connStateConnect        // cs，client和server双向确认连接
-	connStateClosing        // 正在关闭，但是读（被关闭）缓存还有数据没有传输完成
+	clientConn connCS = 0
+	serverConn connCS = 1
+)
+
+// Conn的状态
+type connState uint8
+
+const (
+	connStateClose   connState = iota // 连接超时/被应用层关闭
+	connStateDial                     // 客户端发起连接
+	connStateAccept                   // 服务端收到连接请求，等待客户端确认
+	connStateConnect                  // cs，client和server双向确认连接
+	connStateClosing                  // 正在关闭，但是读（被关闭）缓存还有数据没有传输完成
 )
 
 type Conn struct {
-	cs               uint8         // clientConn/serverConn
-	state            uint8         // 状态
-	lock             sync.RWMutex  // 同步锁
-	connected        chan int      // 建立连接的信号
-	closed           chan struct{} // 关闭的信号
-	timer            *time.Timer   // 计时器
-	lLAddr           *net.UDPAddr  // 本地监听地址
-	lIAddr           *net.UDPAddr  // 本地互联网地址
-	rLAddr           *net.UDPAddr  // 对方监听地址
-	rIAddr           *net.UDPAddr  // 对方互联网地址
-	ioBytes          uint64RW      // io读写总字节
-	readTime         time.Time     // 上一次读取有效数据的时间
-	readLock         sync.RWMutex  // 读缓存锁
-	readable         chan int      // 可读通知
-	readTimeout      time.Time     // 应用层设置的io读超时
-	readQueue        *readData     // 读队列，第一个数据包，仅仅作为指针
-	readQueueLen     uint32        // 读队列长度
-	readQueueMaxLen  uint32        // 读队列最大长度
-	readNextSN       uint32        // 读队列接收到的连续的数据包最大序号
-	readMinSN        uint32        // 读队列最小序号，接收窗口控制
-	readMaxSN        uint32        // 读队列最大序号，接收窗口控制
-	readMSS          uint16        // 读队列的每个数据包的大小（对方的写队列数据包大小）
-	writeLock        sync.RWMutex  // 写缓存锁
-	writeTimeout     time.Time     // 应用层设置的io写超时
-	writeable        chan int      // 可写通知
-	writeQueueHead   *writeData    // 写队列，第一个数据包，仅仅作为指针
-	writeQueueTail   *writeData    // 写队列，最后一个数据包
-	writeQueueLen    uint32        // 写队列长度
-	writeQueueMaxLen uint32        // 写队列最大长度
-	writeSN          uint32        // 写队列的最大sn
-	writeMSS         uint16        // 写队列的每个数据包的大小
-	writeMax         uint32        // 对方读缓存队列剩余长度，发送窗口控制
-	rto              time.Duration // 超时重发
-	rtt              time.Duration // 实时RTT，用于计算rto
-	rttVar           time.Duration // 平均RTT，用于计算rto
-	minRTO           time.Duration // 最小rto，不要出现"过快"
-	maxRTO           time.Duration // 最大rto，不要出现"假死"
-	cToken           uint32        // 客户端token
-	sToken           uint32        // 服务端token
-	pingId           uint32        // ping消息的id，递增
+	cs               connCS         // clientConn/serverConn
+	state            connState      // 状态
+	lock             sync.RWMutex   // 同步锁
+	connected        chan connState // 建立连接的信号
+	closed           chan struct{}  // 关闭的信号
+	timer            *time.Timer    // 计时器
+	lLAddr           *net.UDPAddr   // 本地监听地址
+	lIAddr           *net.UDPAddr   // 本地互联网地址
+	rLAddr           *net.UDPAddr   // 对方监听地址
+	rIAddr           *net.UDPAddr   // 对方互联网地址
+	ioBytes          uint64RW       // io读写总字节
+	readTime         time.Time      // 上一次读取有效数据的时间
+	readLock         sync.RWMutex   // 读缓存锁
+	readable         chan int       // 可读通知
+	readTimeout      time.Time      // 应用层设置的io读超时
+	readQueue        *readData      // 接收队列，第一个数据包，仅仅作为指针
+	readQueueLen     uint32         // 接收队列长度
+	readQueueMaxLen  uint32         // 接收队列最大长度
+	readNextSN       uint32         // 接收队列接收到的连续的数据包最大序号
+	readMinSN        uint32         // 接收队列最小序号，接收窗口控制
+	readMaxSN        uint32         // 接收队列最大序号，接收窗口控制
+	readMSS          uint16         // 接收队列的每个数据包的大小（对方的发送队列数据包大小）
+	writeLock        sync.RWMutex   // 写缓存锁
+	writeTimeout     time.Time      // 应用层设置的io写超时
+	writeable        chan int       // 可写通知
+	writeQueueHead   *writeData     // 发送队列，第一个数据包，仅仅作为指针
+	writeQueueTail   *writeData     // 发送队列，最后一个数据包
+	writeQueueLen    uint32         // 发送队列长度
+	writeQueueMaxLen uint32         // 发送队列最大长度
+	writeSN          uint32         // 发送队列的最大sn
+	writeMSS         uint16         // 发送队列的每个数据包的大小
+	writeMax         uint32         // 对方读缓存队列剩余长度，发送窗口控制
+	rto              time.Duration  // 超时重发
+	rtt              time.Duration  // 实时RTT，用于计算rto
+	rttVar           time.Duration  // 平均RTT，用于计算rto
+	minRTO           time.Duration  // 最小rto，不要出现"过快"
+	maxRTO           time.Duration  // 最大rto，不要出现"假死"
+	cToken           uint32         // 客户端token
+	sToken           uint32         // 服务端token
+	pingId           uint32         // ping消息的id，递增
 }
 
 // 返回net.OpError
@@ -308,15 +318,14 @@ func (this *Conn) newReadData(sn uint32, buf []byte, next *readData) *readData {
 	return d
 }
 
-// 在写队列末尾，添加一个初始化的writeData
+// 在发送队列末尾，添加一个初始化的writeData
 func (this *Conn) newWriteData() {
 	d := writeDataPool.Get().(*writeData)
 	d.sn = this.writeSN
 	d.next = nil
 	d.first = time.Time{}
 	d.buf[msgType] = msgData[this.cs]
-	binary.BigEndian.PutUint32(d.buf[msgCToken:], this.cToken)
-	binary.BigEndian.PutUint32(d.buf[msgSToken:], this.sToken)
+	binary.BigEndian.PutUint32(d.buf[msgDataToken:], this.sToken)
 	binary.BigEndian.PutUint32(d.buf[msgSN:], d.sn)
 	d.len = msgPayload
 	this.writeQueueTail.next = d
@@ -398,18 +407,18 @@ func (this *Conn) writeEOF() {
 }
 
 // 从队列中移除小于sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteDataBefore(sn uint32) bool {
+func (this *Conn) rmWriteDataBefore(sn uint32) {
 	// 检查sn是否在发送窗口范围
 	if this.writeQueueTail != this.writeQueueHead &&
 		this.writeQueueTail.sn < sn {
-		return false
+		return
 	}
 	now := time.Now()
-	// 遍历写队列数据包
+	// 遍历发送队列数据包
 	cur := this.writeQueueHead.next
 	for cur != nil {
 		if cur.sn > sn {
-			return false
+			return
 		}
 		// rto
 		this.calcRTO(now.Sub(cur.first))
@@ -420,23 +429,27 @@ func (this *Conn) rmWriteDataBefore(sn uint32) bool {
 	}
 	this.writeQueueHead.next = cur
 	this.writeQueueTail = this.writeQueueHead
-	return true
+	// 可写通知
+	select {
+	case this.writeable <- 1:
+	default:
+	}
 }
 
 // 从队列中移除指定sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteData(sn uint32) bool {
+func (this *Conn) rmWriteData(sn uint32) {
 	// 检查sn是否在发送窗口范围
 	if this.writeQueueTail != this.writeQueueHead &&
 		this.writeQueueTail.sn < sn {
-		return false
+		return
 	}
-	// 遍历写队列数据包
+	// 遍历发送队列数据包
 	prev := this.writeQueueHead
 	cur := prev.next
 	for cur != nil {
 		// 因为是递增有序队列，sn如果小于当前，就没必要继续
 		if sn < cur.sn {
-			return false
+			return
 		}
 		if sn == cur.sn {
 			// rto
@@ -448,12 +461,16 @@ func (this *Conn) rmWriteData(sn uint32) bool {
 			}
 			writeDataPool.Put(cur)
 			this.writeQueueLen--
-			return true
+			// 可写通知
+			select {
+			case this.writeable <- 1:
+			default:
+			}
+			return
 		}
 		prev = cur
 		cur = prev.next
 	}
-	return false
 }
 
 // 移除第一个数据包
@@ -464,7 +481,7 @@ func (this *Conn) rmFrontReadData() {
 	this.readQueueLen--
 }
 
-// 检查写队列，超时重发
+// 检查发送队列，超时重发
 func (this *Conn) writeToUDP(out func(data []byte), now time.Time) {
 	// 需要发送的数据包个数
 	n := this.writeQueueLen
@@ -480,7 +497,7 @@ func (this *Conn) writeToUDP(out func(data []byte), now time.Time) {
 	if n == 0 {
 		n = 1
 	}
-	// 开始遍历写队列
+	// 开始遍历发送队列
 	prev := this.writeQueueHead
 	cur := prev.next
 	for cur != nil && n > 0 {
@@ -507,7 +524,7 @@ func (this *Conn) readFromUDP(sn uint32, buf []byte) bool {
 	if sn < this.readMinSN || sn > this.readMaxSN {
 		return false
 	}
-	// 遍历读队列
+	// 遍历接收队列
 	prev := this.readQueue
 	cur := prev.next
 	for cur != nil {
@@ -551,26 +568,80 @@ func (this *Conn) calcRTO(rtt time.Duration) {
 	}
 }
 
-func (this *Conn) writeMsgDial(buf []byte) {
-
+func (this *Conn) writeMsgDial(buf []byte, timeout time.Duration) {
+	buf[msgType] = msgDial
+	binary.BigEndian.PutUint32(buf[msgDialToken:], this.cToken)
+	binary.BigEndian.PutUint32(buf[msgDialVersion:], msgVersion)
+	copy(buf[msgDialLocalIP:], this.lLAddr.IP.To16())
+	binary.BigEndian.PutUint16(buf[msgDialLocalPort:], uint16(this.lLAddr.Port))
+	copy(buf[msgDialRemoteIP:], this.rIAddr.IP.To16())
+	binary.BigEndian.PutUint16(buf[msgDialRemotePort:], uint16(this.rIAddr.Port))
+	binary.BigEndian.PutUint16(buf[msgDialMSS:], this.writeMSS)
+	binary.BigEndian.PutUint64(buf[msgDialTimeout:], uint64(timeout))
 }
 
-func (this *Conn) readMsgDial(buf []byte) {
-
+func (this *Conn) readMsgDial(buf []byte, size uint32) {
+	this.rLAddr.IP = append(this.rLAddr.IP, buf[msgDialLocalIP:msgDialLocalPort]...)
+	this.rLAddr.Port = int(binary.BigEndian.Uint16(buf[msgDialLocalPort:]))
+	this.lIAddr.IP = append(this.lIAddr.IP, buf[msgDialRemoteIP:msgDialRemotePort]...)
+	this.lIAddr.Port = int(binary.BigEndian.Uint16(buf[msgDialRemotePort:]))
+	this.readMSS = binary.BigEndian.Uint16(buf[msgDialMSS:])
+	this.readQueueMaxLen = calcMaxLen(size, this.readMSS)
 }
 
 func (this *Conn) writeMsgAccept(buf []byte) {
-
+	buf[msgType] = msgAccept
+	binary.BigEndian.PutUint32(buf[msgAcceptCToken:], this.cToken)
+	binary.BigEndian.PutUint32(buf[msgAcceptSToken:], this.sToken)
+	binary.BigEndian.PutUint32(buf[msgAcceptVersion:], msgVersion)
+	copy(buf[msgAcceptLocalIP:], this.lLAddr.IP.To16())
+	binary.BigEndian.PutUint16(buf[msgAcceptLocalPort:], uint16(this.lLAddr.Port))
+	copy(buf[msgAcceptRemoteIP:], this.rIAddr.IP.To16())
+	binary.BigEndian.PutUint16(buf[msgAcceptRemotePort:], uint16(this.rIAddr.Port))
+	binary.BigEndian.PutUint16(buf[msgAcceptMSS:], this.writeMSS)
 }
 
-func (this *Conn) readMsgAccept(buf []byte) {
-
+func (this *Conn) readMsgAccept(buf []byte, size uint32) {
+	this.rLAddr.IP = append(this.rLAddr.IP, buf[msgAcceptLocalIP:msgAcceptLocalPort]...)
+	this.rLAddr.Port = int(binary.BigEndian.Uint16(buf[msgAcceptLocalPort:]))
+	this.lIAddr.IP = append(this.lIAddr.IP, buf[msgAcceptRemoteIP:msgAcceptRemotePort]...)
+	this.lIAddr.Port = int(binary.BigEndian.Uint16(buf[msgAcceptRemotePort:]))
+	this.readMSS = binary.BigEndian.Uint16(buf[msgAcceptMSS:])
+	this.readQueueMaxLen = calcMaxLen(size, this.readMSS)
 }
 
 func (this *Conn) writeMsgConnect(buf []byte) {
-
+	buf[msgType] = msgConnect
+	binary.BigEndian.PutUint32(buf[msgConnectToken:], this.sToken)
 }
 
 func (this *Conn) writeMsgAck(buf []byte) {
 
+}
+
+func (this *Conn) readMsgPong(buf []byte) {
+	id := binary.BigEndian.Uint32(buf[msgPongPingId:])
+	this.readLock.Lock()
+	if this.pingId != id {
+		this.readLock.Unlock()
+		return
+	}
+	this.pingId++
+	this.readLock.Unlock()
+
+	this.writeLock.Lock()
+	this.rmWriteDataBefore(binary.BigEndian.Uint32(buf[msgPongMaxSN:]))
+	this.writeMax = binary.BigEndian.Uint32(buf[msgPongRemains:])
+	this.writeLock.Unlock()
+}
+
+func (this *Conn) writeMsgPong(buf []byte) {
+	ping_id := binary.BigEndian.Uint32(buf[msgPingId:])
+	buf[msgType] = msgPong
+	binary.BigEndian.PutUint32(buf[msgPongToken:], this.sToken)
+	binary.BigEndian.PutUint32(buf[msgPongPingId:], ping_id)
+	this.readLock.RLock()
+	binary.BigEndian.PutUint32(buf[msgPongMaxSN:], this.readNextSN)
+	binary.BigEndian.PutUint32(buf[msgPongRemains:], this.readQueueMaxLen-this.readQueueLen)
+	this.readLock.RUnlock()
 }

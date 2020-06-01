@@ -35,13 +35,11 @@ const (
 )
 
 const (
-	msgVersion = 1             // 消息的版本，不同的版本可能字段不一样
-	msgBuffLen = maxMSS        // 消息缓存大小，udpData中使用
-	msgType    = 0             // 消息类型下标
-	msgCToken  = msgType + 1   // 消息客户端token下标
-	msgSToken  = msgCToken + 4 // 消息服务端token下标
-	msgSN      = msgSToken + 4 // 消息sn下标
-	msgPayload = msgSN + 4     // 消息数据起始下标
+	msgVersion = 1            // 消息的版本，不同的版本可能字段不一样
+	msgType    = 0            // 消息类型下标
+	msgToken   = msgType + 1  // 消息token下标
+	msgSN      = msgToken + 4 // 消息sn下标
+	msgPayload = msgSN + 4    // 消息数据起始下标
 )
 
 var (
@@ -59,9 +57,7 @@ const (
 	msgDialRemoteIP   = msgDialLocalPort + 4  // 对方公网ip
 	msgDialRemotePort = msgDialRemoteIP + 16  // 对方公网端口
 	msgDialMSS        = msgDialRemotePort + 2 // udp数据包大小，窗口控制参考值
-	msgDialReadQueue  = msgDialMSS + 2        // 接收队列（窗口）大小，窗口控制参考值
-	msgDialWriteQueue = msgDialReadQueue + 4  // 发送队列（窗口）大小，窗口控制参考值
-	msgDialTimeout    = msgDialWriteQueue + 4 // Dial函数的连接超时
+	msgDialTimeout    = msgDialMSS + 4        // Dial函数的连接超时
 	msgDialLength     = msgDialTimeout + 8
 )
 
@@ -75,9 +71,7 @@ const (
 	msgAcceptRemoteIP   = msgAcceptLocalPort + 4  // 对方公网ip
 	msgAcceptRemotePort = msgAcceptRemoteIP + 16  // 对方公网端口
 	msgAcceptMSS        = msgAcceptRemotePort + 2 // udp数据包大小，窗口控制参考值
-	msgAcceptReadQueue  = msgAcceptMSS + 2        // 接收队列（窗口）大小，窗口控制参考值
-	msgAcceptWriteQueue = msgAcceptReadQueue + 4  // 发送队列（窗口）大小，窗口控制参考值
-	msgAcceptLength     = msgAcceptWriteQueue + 4
+	msgAcceptLength     = msgAcceptMSS + 4
 )
 
 // msgRefuse字段下标
@@ -95,38 +89,34 @@ const (
 
 // msgData字段下标
 const (
-	msgDataCToken  = msgType + 1       // 客户端token
-	msgDataSToken  = msgDataCToken + 4 // 服务端token
-	msgDataSN      = msgDataSToken + 4 // 数据包的序号
+	msgDataToken   = msgType + 1      // 连接token
+	msgDataSN      = msgDataToken + 4 // 数据包的序号
 	msgDataPayload = msgDataSN + 4
 )
 
 // msgAck字段下标
 const (
-	msgAckCToken  = msgType + 1       // 客户端token
-	msgAckSToken  = msgAckCToken + 4  // 服务端token
-	msgAckSN      = msgAckSToken + 4  // 数据包的序号
+	msgAckToken   = msgType + 1       // 连接token
+	msgAckSN      = msgAckToken + 4   // 当前数据包的序号
 	msgAckMaxSN   = msgAckSN + 4      // 连续数据包的序号
 	msgAckRemains = msgAckMaxSN + 4   // 剩余的接受缓存容量长度
-	msgAckTime    = msgAckRemains + 4 // ack的时间，
-	msgAckLength  = msgAckTime + 8
+	msgAckId      = msgAckRemains + 4 // ack的时间，
+	msgAckLength  = msgAckId + 8
 )
 
 // msgPing字段下标
 const (
-	msgPingCToken = msgType + 1       // 客户端token
-	msgPingSToken = msgPingCToken + 4 // 服务端token
-	msgPingId     = msgPingSToken + 4 // 每一个ping消息的id，递增
+	msgPingToken  = msgType + 1      // 连接token
+	msgPingId     = msgPingToken + 4 // 每一个ping消息的id，递增
 	msgPingLength = msgPingId + 4
 )
 
 // msgPong字段下标
 const (
-	msgPongCToken  = msgType + 1       // 客户端token
-	msgPongSToken  = msgPongCToken + 4 // 服务端token
-	msgPongPingId  = msgPongSToken + 4 // ping传过来的id
-	msgPongSN      = msgPongPingId + 4 // 连续数据包的序号
-	msgPongRemains = msgPongSN + 4     // 剩余的接受缓存容量长度
+	msgPongToken   = msgType + 1       // 连接token
+	msgPongPingId  = msgPongToken + 4  // ping传过来的id
+	msgPongMaxSN   = msgPongPingId + 4 // 连续数据包的序号
+	msgPongRemains = msgPongMaxSN + 4  // 剩余的接受缓存容量长度
 	msgPongLength  = msgPongRemains + 4
 )
 

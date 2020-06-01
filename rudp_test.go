@@ -1,6 +1,7 @@
 package rudp
 
 import (
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -9,33 +10,46 @@ import (
 func Test_RUDP_Dial_Accept(t *testing.T) {
 	wait := sync.WaitGroup{}
 	wait.Add(2)
+	server, err := New("127.0.0.1:10000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := New("127.0.0.1:20000")
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
 		defer wait.Done()
-		server, err := New("127.0.0.1:10000")
-		if err != nil {
-			t.Fatal(err)
-		}
 		conn, err := server.Accept()
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Log("conn from", conn.RemoteAddr())
-		conn.Close()
-		server.Close()
+		var buf udpBuf
+		n, err := conn.Read(buf[:])
+		if err != nil {
+			if err != io.EOF {
+				t.Fatal(err)
+			}
+			conn.Close()
+		} else {
+			t.Log(string(buf[:n]))
+		}
 	}()
 	go func() {
 		defer wait.Done()
-		client, err := New("127.0.0.1:20000")
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn, err := client.Dial("127.0.0.1:10000", time.Second)
+		conn, err := client.Dial("127.0.0.1:10000", time.Second*10)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Log("conn from", conn.RemoteAddr())
+		_, err = conn.Write([]byte("hello"))
+		if err != nil {
+			t.Fatal(err)
+		}
 		conn.Close()
-		client.Close()
 	}()
 	wait.Wait()
+	server.Close()
+	client.Close()
 }

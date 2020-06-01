@@ -2,6 +2,7 @@ package rudp
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"runtime"
 	"sync"
@@ -88,6 +89,7 @@ func (this *RUDP) Close() error {
 	if err != nil {
 		return err
 	}
+	this.valid = false
 	// 通知所有协程退出
 	close(this.closed)
 	close(this.accepted)
@@ -208,44 +210,6 @@ func (this *RUDP) handleUDPDataRoutine() {
 	}
 }
 
-// 关闭并释放Conn的资源
-func (this *RUDP) freeConn(conn *Conn) {
-	conn.lock.Lock()
-	if conn.state != connStateClose {
-		conn.state = connStateClose
-	}
-	conn.lock.Unlock()
-	// 移除
-	var key connKey
-	key.Init(conn.rIAddr)
-	// 移除connecting
-	key.token = conn.cToken
-	this.lock[conn.cs].Lock()
-	delete(this.connecting[conn.cs], key)
-	// 移除connected
-	key.token = conn.sToken
-	delete(this.connected[conn.cs], key)
-	this.lock[conn.cs].Unlock()
-	// 释放资源
-	close(conn.closed)
-	close(conn.connected)
-	close(conn.readable)
-	close(conn.writeable)
-	conn.timer.Stop()
-	r := conn.readQueue
-	for r != nil {
-		n := r.next
-		readDataPool.Put(r)
-		r = n
-	}
-	w := conn.writeQueueHead
-	for w != nil {
-		n := w.next
-		readDataPool.Put(w)
-		w = n
-	}
-}
-
 // 连接指定的地址
 func (this *RUDP) Dial(addr string, timeout time.Duration) (*Conn, error) {
 	// 新的客户端Conn
@@ -253,17 +217,19 @@ func (this *RUDP) Dial(addr string, timeout time.Duration) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	// msgDial循环
+	// 发送msgDial
 	var buf [maxMSS]byte
-	conn.writeMsgDial(buf[:])
+	conn.writeMsgDial(buf[:], timeout)
 	conn.timer.Reset(0)
-	for err != nil {
+	for err == nil {
 		select {
-		case <-time.After(timeout):
-			err = conn.netOpError("dial", opErr("timeout"))
-		case <-conn.timer.C: // 超时重发
-			this.WriteToConn(buf[:msgDialLength], conn)
-			conn.timer.Reset(conn.rto)
+		case now := <-conn.timer.C: // 超时重发
+			if now.Sub(conn.readTime) >= timeout {
+				err = conn.netOpError("dial", opErr("timeout"))
+			} else {
+				this.WriteToConn(buf[:msgDialLength], conn)
+				conn.timer.Reset(conn.rto)
+			}
 		case state := <-conn.connected: // 建立连接结果通知
 			switch state {
 			case connStateConnect: // 已经建立连接
@@ -283,15 +249,30 @@ func (this *RUDP) Dial(addr string, timeout time.Duration) (*Conn, error) {
 }
 
 // 创建一个新的Conn变量
-func (this *RUDP) newConn(cs, state uint8, rAddr *net.UDPAddr) *Conn {
+func (this *RUDP) newConn(cs connCS, state connState, rAddr *net.UDPAddr) *Conn {
 	p := new(Conn)
 	p.cs = cs
 	p.state = state
-	p.connected = make(chan int, 1)
+	p.connected = make(chan connState, 1)
 	p.closed = make(chan struct{})
+	p.timer = time.NewTimer(0)
 	p.lLAddr = this.conn.LocalAddr().(*net.UDPAddr)
+	p.lIAddr = new(net.UDPAddr)
+	p.rLAddr = new(net.UDPAddr)
 	p.rIAddr = rAddr
+	p.readQueue = readDataPool.Get().(*readData)
+	p.readQueue.next = nil
+	p.readable = make(chan int, 1)
+	p.readable <- 1
 	p.readTime = time.Now()
+	p.writeQueueHead = writeDataPool.Get().(*writeData)
+	p.writeQueueHead.next = nil
+	p.writeQueueTail = p.writeQueueHead
+	p.writeable = make(chan int, 1)
+	p.writeable <- 1
+	p.rto = this.connRTO
+	p.minRTO = this.connMinRTO
+	p.maxRTO = this.connMaxRTO
 	return p
 }
 
@@ -322,6 +303,9 @@ func (this *RUDP) newDialConn(addr string) (*Conn, error) {
 		}
 	}
 	this.lock[clientConn].Unlock()
+	// mss
+	conn.writeMSS = DetectMSS(rAddr)
+	conn.writeQueueMaxLen = calcMaxLen(this.connBuffer.w, conn.writeMSS)
 	return conn, nil
 }
 
@@ -344,6 +328,8 @@ func (this *RUDP) newAcceptConn(token uint32, cAddr *net.UDPAddr) *Conn {
 		return nil
 	}
 	conn = this.newConn(serverConn, connStateAccept, cAddr)
+	this.connecting[serverConn][key] = conn
+	//
 	conn.cToken = token
 	this.connecting[serverConn][key] = conn
 	for this.valid {
@@ -356,7 +342,51 @@ func (this *RUDP) newAcceptConn(token uint32, cAddr *net.UDPAddr) *Conn {
 			break
 		}
 	}
+	this.lock[serverConn].Unlock()
+	// 探测mss，并根据设定的缓存，确定发送队列的大小
+	conn.writeMSS = DetectMSS(cAddr)
+	conn.writeQueueMaxLen = calcMaxLen(this.connBuffer.w, conn.writeMSS)
 	return conn
+}
+
+// 关闭并释放Conn的资源
+func (this *RUDP) freeConn(conn *Conn) {
+	conn.lock.Lock()
+	if conn.state == connStateClose {
+		conn.lock.Unlock()
+		return
+	}
+	conn.state = connStateClose
+	conn.lock.Unlock()
+	// 移除
+	var key connKey
+	key.Init(conn.rIAddr)
+	// 移除connecting
+	key.token = conn.cToken
+	this.lock[conn.cs].Lock()
+	delete(this.connecting[conn.cs], key)
+	// 移除connected
+	key.token = conn.sToken
+	delete(this.connected[conn.cs], key)
+	this.lock[conn.cs].Unlock()
+	// 释放资源
+	close(conn.closed)
+	close(conn.connected)
+	close(conn.readable)
+	close(conn.writeable)
+	conn.timer.Stop()
+	r := conn.readQueue
+	for r != nil {
+		n := r.next
+		readDataPool.Put(r)
+		r = n
+	}
+	w := conn.writeQueueHead
+	for w != nil {
+		n := w.next
+		writeDataPool.Put(w)
+		w = n
+	}
 }
 
 // 客户端Conn写协程
@@ -377,9 +407,10 @@ func (this *RUDP) serverConnRoutine(conn *Conn, timeout time.Duration) {
 		this.freeConn(conn)
 		this.wait.Done()
 	}()
-	// 发送msgAccept
+	// msgAccept
 	var buf [maxMSS]byte
 	conn.writeMsgAccept(buf[:])
+	// 发送
 	conn.timer.Reset(0)
 	for {
 		select {
@@ -391,9 +422,10 @@ func (this *RUDP) serverConnRoutine(conn *Conn, timeout time.Duration) {
 			if now.Sub(conn.readTime) >= timeout {
 				return
 			}
-			this.WriteToConn(buf[:msgAckLength], conn)
+			this.WriteToConn(buf[:msgAcceptLength], conn)
 			conn.timer.Reset(conn.rto)
 		case <-conn.connected: // Conn连接通知
+			this.accepted <- conn
 			this.connWriteLoop(conn)
 			return
 		}
@@ -412,7 +444,7 @@ func (this *RUDP) connectingConn(cs uint8, token uint32, addr *net.UDPAddr) *Con
 }
 
 // 获取connected Conn
-func (this *RUDP) connectedConn(cs uint8, token uint32, addr *net.UDPAddr) *Conn {
+func (this *RUDP) connectedConn(cs connCS, token uint32, addr *net.UDPAddr) *Conn {
 	var key connKey
 	key.Init(addr)
 	key.token = token
@@ -443,16 +475,19 @@ func (this *RUDP) connWriteLoop(conn *Conn) {
 
 // 处理msgDial
 func (this *RUDP) handleMsgDial(buf []byte, n int, addr *net.UDPAddr) {
-	// 没有开启服务
-	if this.accepted == nil {
-		return
-	}
 	// 消息大小和版本
-	if n != msgDialLength || buf[msgDialVersion] != msgVersion {
+	if n != msgDialLength || binary.BigEndian.Uint32(buf[msgDialVersion:]) != msgVersion {
 		return
 	}
 	// 客户端token
-	cToken := binary.BigEndian.Uint32(buf[msgCToken:])
+	cToken := binary.BigEndian.Uint32(buf[msgToken:])
+	// 没有开启服务
+	if this.accepted == nil {
+		buf[msgType] = msgRefuse
+		binary.BigEndian.PutUint32(buf[msgRefuseToken:], cToken)
+		this.WriteTo(buf[:msgRefuseLength], addr)
+		return
+	}
 	// accepting Conn
 	conn := this.newAcceptConn(cToken, addr)
 	if conn == nil {
@@ -462,18 +497,32 @@ func (this *RUDP) handleMsgDial(buf []byte, n int, addr *net.UDPAddr) {
 		this.WriteTo(buf[:msgRefuseLength], addr)
 		return
 	}
-	conn.readMsgDial(buf)
+	conn.readMsgDial(buf, this.connBuffer.r)
 	// 启动服务端Conn写协程
 	go this.serverConnRoutine(conn, time.Duration(binary.BigEndian.Uint64(buf[msgDialTimeout:])))
+	fmt.Sprintf("msg-dial: "+
+		"token<%d>,"+
+		"version<%d>,"+
+		"remote listen address<%s>,"+
+		"local internet address<%s>,"+
+		"mss<%d>,"+
+		"timeout<%v>"+
+		"\n",
+		conn.cToken,
+		binary.BigEndian.Uint32(buf[msgDialVersion:]),
+		conn.rLAddr.String(),
+		conn.lIAddr.String(),
+		conn.readMSS,
+		time.Duration(binary.BigEndian.Uint64(buf[msgDialTimeout:])))
 }
 
 // 处理msgAccept
 func (this *RUDP) handleMsgAccept(buf []byte, n int, addr *net.UDPAddr) {
 	// 检查消息大小和版本
-	if n != msgDialLength || buf[msgDialVersion] != msgVersion {
+	if n != msgAcceptLength || binary.BigEndian.Uint32(buf[msgAcceptVersion:]) != msgVersion {
 		return
 	}
-	// Conn
+	// connecting Conn
 	var key connKey
 	key.Init(addr)
 	key.token = binary.BigEndian.Uint32(buf[msgAcceptCToken:])
@@ -503,9 +552,9 @@ func (this *RUDP) handleMsgAccept(buf []byte, n int, addr *net.UDPAddr) {
 		this.connected[clientConn][key] = conn
 		this.lock[clientConn].Unlock()
 		// 读取消息数据
-		conn.readMsgAccept(buf)
+		conn.readMsgAccept(buf, this.connBuffer.r)
 		// 通知连接
-		conn.connected <- 1
+		conn.connected <- connStateConnect
 		// 启动客户端Conn写协程
 		go this.clientConnRoutine(conn)
 	case connStateConnect:
@@ -521,15 +570,29 @@ func (this *RUDP) handleMsgAccept(buf []byte, n int, addr *net.UDPAddr) {
 	// 发送msgConnect
 	conn.writeMsgConnect(buf)
 	this.WriteToConn(buf[:msgConnectLength], conn)
+	fmt.Sprintf("msg-accept: "+
+		"client-token<%d>,"+
+		"server-token<%d>,"+
+		"version<%d>,"+
+		"remote listen address<%s>,"+
+		"local internet address<%s>,"+
+		"mss<%d>"+
+		"\n",
+		conn.cToken,
+		conn.sToken,
+		binary.BigEndian.Uint32(buf[msgAcceptVersion:]),
+		conn.rLAddr.String(),
+		conn.lIAddr.String(),
+		conn.readMSS)
 }
 
 // 处理msgRefuse
 func (this *RUDP) handleMsgRefuse(buf []byte, n int, addr *net.UDPAddr) {
 	// 检查消息大小和版本
-	if n != msgRefuseLength || buf[msgRefuseVersion] != msgVersion {
+	if n != msgRefuseLength || binary.BigEndian.Uint32(buf[msgRefuseVersion:]) != msgVersion {
 		return
 	}
-	// Conn
+	// connecting Conn
 	var key connKey
 	key.Init(addr)
 	key.token = binary.BigEndian.Uint32(buf[msgRefuseToken:])
@@ -554,6 +617,12 @@ func (this *RUDP) handleMsgRefuse(buf []byte, n int, addr *net.UDPAddr) {
 		// connStateConnect: 已经连接
 		conn.lock.Unlock()
 	}
+	fmt.Sprintf("msg-refuse: "+
+		"token<%d>,"+
+		"version<%d>"+
+		"\n",
+		key.token,
+		binary.BigEndian.Uint32(buf[msgRefuseVersion:]))
 }
 
 // 处理msgConnect
@@ -571,7 +640,7 @@ func (this *RUDP) handleMsgConnect(buf []byte, n int, addr *net.UDPAddr) {
 	key.Init(addr)
 	key.token = binary.BigEndian.Uint32(buf[msgConnectToken:])
 	this.lock[serverConn].RLock()
-	conn, ok := this.connecting[serverConn][key]
+	conn, ok := this.connected[serverConn][key]
 	this.lock[serverConn].RUnlock()
 	// 不存在不处理
 	if !ok {
@@ -599,10 +668,14 @@ func (this *RUDP) handleMsgConnect(buf []byte, n int, addr *net.UDPAddr) {
 		// connStateClose，关闭了
 		conn.lock.Unlock()
 	}
+	fmt.Sprintf("msg-connect: "+
+		"token<%d>"+
+		"\n",
+		key.token)
 }
 
 // 处理msgData
-func (this *RUDP) handleMsgData(cs uint8, buf []byte, n int, addr *net.UDPAddr) {
+func (this *RUDP) handleMsgData(cs connCS, buf []byte, n int, addr *net.UDPAddr) {
 	if n < msgDataPayload {
 		return
 	}
@@ -619,13 +692,23 @@ func (this *RUDP) handleMsgData(cs uint8, buf []byte, n int, addr *net.UDPAddr) 
 	if conn.readFromUDP(sn, buf[msgDataPayload:n]) {
 		conn.writeMsgAck(buf)
 		// 可读通知
+		select {
+		case conn.readable <- 1:
+		default:
+		}
 	}
 	conn.readLock.Unlock()
 	this.WriteToConn(buf[:msgAckLength], conn)
+	fmt.Sprintf("msg-data: "+
+		"token<%d>,"+
+		"sn<%d>"+
+		"\n",
+		token,
+		sn)
 }
 
 // 处理msgAck
-func (this *RUDP) handleMsgAck(cs uint8, buf []byte, n int, addr *net.UDPAddr) {
+func (this *RUDP) handleMsgAck(cs connCS, buf []byte, n int, addr *net.UDPAddr) {
 	if n != msgAckLength {
 		return
 	}
@@ -637,21 +720,32 @@ func (this *RUDP) handleMsgAck(cs uint8, buf []byte, n int, addr *net.UDPAddr) {
 	}
 	sn := binary.BigEndian.Uint32(buf[msgAckSN:])
 	max_sn := binary.BigEndian.Uint32(buf[msgAckMaxSN:])
+	remains := binary.BigEndian.Uint32(buf[msgAckRemains:])
+	ack_id := binary.BigEndian.Uint32(buf[msgAckId:])
 	conn.writeLock.Lock()
 	if sn < max_sn {
-		if conn.rmWriteDataBefore(max_sn) {
-			// 可写通知
-		}
+		conn.rmWriteDataBefore(max_sn)
 	} else {
-		if conn.rmWriteData(sn) {
-			// 可写通知
-		}
+		conn.rmWriteData(sn)
 	}
 	conn.writeLock.Unlock()
+	fmt.Sprintf("msg-ack: "+
+		"token<%d>,"+
+		"sn<%d>,"+
+		"max sn<%d>,"+
+		"remains<%d>,"+
+		"id<%d>"+
+		"\n",
+		token,
+		sn,
+		max_sn,
+		remains,
+		ack_id,
+	)
 }
 
 // 处理msgInvalid
-func (this *RUDP) handleMsgInvalid(cs uint8, buf []byte, n int, addr *net.UDPAddr) {
+func (this *RUDP) handleMsgInvalid(cs connCS, buf []byte, n int, addr *net.UDPAddr) {
 	if n != msgInvalidLength {
 		return
 	}
@@ -662,32 +756,62 @@ func (this *RUDP) handleMsgInvalid(cs uint8, buf []byte, n int, addr *net.UDPAdd
 		return
 	}
 	this.freeConn(conn)
+	fmt.Sprintf("msg-invalid: "+
+		"token<%d>"+
+		"\n",
+		token,
+	)
 }
 
 // 处理msgPing
 func (this *RUDP) handleMsgPing(buf []byte, n int, addr *net.UDPAddr) {
-	//if len != msgPingLength {
-	//	return
-	//}
-	//conn, ok := this.getConnectedConn(serverConn, msg)
-	//if !ok {
-	//	this.writeMsgInvalid(msg, msgInvalidC)
-	//	return
-	//}
-	//conn.writeMsgPong(msg, binary.BigEndian.Uint32(buf[msgPingId:]))
-	//this.WriteToConn(buf[:msgPongLength], conn)
+	if n != msgPingLength {
+		return
+	}
+	// Conn
+	token := binary.BigEndian.Uint32(buf[msgPingToken:])
+	conn := this.connectedConn(serverConn, token, addr)
+	if conn == nil {
+		return
+	}
+	conn.writeMsgPong(buf)
+	this.WriteToConn(buf[:msgPongLength], conn)
+	fmt.Sprintf("msg-ping: "+
+		"token<%d>,"+
+		"ping id<%d>"+
+		"\n",
+		token,
+		binary.BigEndian.Uint32(buf[msgPongPingId:]),
+	)
 }
 
 // 处理msgPong
 func (this *RUDP) handleMsgPong(buf []byte, n int, addr *net.UDPAddr) {
-	//conn, ok := this.getConnectedConn(clientConn, msg)
-	//if ok {
-	//	conn.readMsgPong(msg)
-	//}
+	if n != msgPongLength {
+		return
+	}
+	// Conn
+	token := binary.BigEndian.Uint32(buf[msgPingToken:])
+	conn := this.connectedConn(clientConn, token, addr)
+	if conn == nil {
+		return
+	}
+	conn.readMsgPong(buf)
+	fmt.Sprintf("msg-pong: "+
+		"token<%d>,"+
+		"ping id<%d>,"+
+		"max sn<%d>,"+
+		"remins<%d>"+
+		"\n",
+		token,
+		binary.BigEndian.Uint32(buf[msgPongPingId:]),
+		binary.BigEndian.Uint32(buf[msgPongMaxSN:]),
+		binary.BigEndian.Uint32(buf[msgPongRemains:]),
+	)
 }
 
 // 发送msgInvalidC/msgInvalidS
-func (this *RUDP) writeMsgInvalid(cs uint8, token uint32, buf []byte, addr *net.UDPAddr) {
+func (this *RUDP) writeMsgInvalid(cs connCS, token uint32, buf []byte, addr *net.UDPAddr) {
 	buf[msgType] = msgInvalid[cs]
 	binary.BigEndian.PutUint32(buf[msgInvalidToken:], token)
 	this.WriteTo(buf[:msgInvalidLength], addr)
