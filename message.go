@@ -96,11 +96,12 @@ const (
 
 // msgAck字段下标
 const (
-	msgAckToken   = msgType + 1     // 连接token
-	msgAckSN      = msgAckToken + 4 // 当前数据包的序号
-	msgAckMaxSN   = msgAckSN + 4    // 连续数据包的序号
-	msgAckRemains = msgAckMaxSN + 4 // 剩余的接受缓存容量长度
-	msgAckLength  = msgAckRemains + 8
+	msgAckToken   = msgType + 1       // 连接token
+	msgAckSN      = msgAckToken + 4   // 当前数据包的序号
+	msgAckMaxSN   = msgAckSN + 4      // 连续数据包的序号
+	msgAckRemains = msgAckMaxSN + 4   // 剩余的接受缓存容量长度
+	msgAckId      = msgAckRemains + 4 // ack发送的时间
+	msgAckLength  = msgAckId + 4
 )
 
 // msgInvalid字段下标

@@ -1,6 +1,8 @@
 package rudp
 
 import (
+	"bytes"
+	"crypto/md5"
 	"io"
 	"sync"
 	"testing"
@@ -10,14 +12,20 @@ import (
 func Test_RUDP_Dial_Accept(t *testing.T) {
 	wait := sync.WaitGroup{}
 	wait.Add(2)
-	server, err := New("127.0.0.1:10000")
+	DefaultConfig.Listen = "127.0.0.1:10000"
+	server, err := NewWithConfig(&DefaultConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := New("127.0.0.1:20000")
+	DefaultConfig.Listen = "127.0.0.1:20000"
+	client, err := NewWithConfig(&DefaultConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	wh := md5.New()
+	rh := md5.New()
+
 	go func() {
 		defer wait.Done()
 		conn, err := server.Accept()
@@ -35,11 +43,7 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 					break
 				}
 			}
-			t.Log(string(buf[:n]))
-			n, err = conn.Write([]byte("server say hello"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			rh.Write(buf[:n])
 		}
 		conn.Close()
 	}()
@@ -50,25 +54,32 @@ func Test_RUDP_Dial_Accept(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Log("conn from", conn.RemoteAddr())
-		_, err = conn.Write([]byte("client say hello"))
-		if err != nil {
-			t.Fatal(err)
+		buf := make([]byte, 1024)
+		for i := 0; i < 1000; i++ {
+			// 随机数据
+			_rand.Read(buf)
+			// 哈希发送的数据
+			wh.Write(buf)
+			_, err = conn.Write(buf)
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
-		var buf udpBuf
-		n, err := conn.Read(buf[:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Log(string(buf[:n]))
 		conn.Close()
 	}()
+
 	wait.Wait()
 	server.Close()
 	client.Close()
+
+	if !bytes.Equal(wh.Sum(nil), rh.Sum(nil)) {
+		t.FailNow()
+	}
 }
 
 func Test_RUDP_Close(t *testing.T) {
-	rudp, err := New("127.0.0.1:10000")
+	DefaultConfig.Listen = "127.0.0.1:10000"
+	rudp, err := NewWithConfig(&DefaultConfig)
 	if err != nil {
 		t.Fatal(err)
 	}

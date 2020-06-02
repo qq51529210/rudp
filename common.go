@@ -137,8 +137,10 @@ func (e closeErr) Error() string   { return string(e) + " has been closed" }
 func (e closeErr) Timeout() bool   { return false }
 func (e closeErr) Temporary() bool { return false }
 
-type timeoutErr string
+var DefaultConfig Config
 
-func (e timeoutErr) Error() string   { return string(e) + "timeout" }
-func (e timeoutErr) Timeout() bool   { return true }
-func (e timeoutErr) Temporary() bool { return false }
+func init() {
+	DefaultConfig.AcceptQueue = 128
+	DefaultConfig.ConnMinRTO = 10
+	DefaultConfig.ConnMaxRTO = 1000
+}

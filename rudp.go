@@ -13,14 +13,6 @@ func init() {
 	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
 }
 
-// 使用默认值创建一个具备cs能力的RUDP
-func New(address string) (*RUDP, error) {
-	var cfg Config
-	cfg.Listen = address
-	cfg.AcceptQueue = 128
-	return NewWithConfig(&cfg)
-}
-
 // 使用配置值创建一个新的RUDP，server能力需要配置Config.AcceptQueue
 func NewWithConfig(cfg *Config) (*RUDP, error) {
 	// 解析地址
@@ -677,27 +669,27 @@ func (this *RUDP) handleMsgData(cs connCS, buf []byte, n int, addr *net.UDPAddr)
 	ok := conn.readFromUDP(sn, buf[msgDataPayload:n])
 	if ok {
 		conn.writeMsgAck(buf, sn)
+		conn.readLock.Unlock()
 		// 可读通知
 		select {
 		case conn.readable <- 1:
 		default:
 		}
-		conn.readLock.Unlock()
 		// 响应ack
 		this.WriteToConn(buf[:msgAckLength], conn)
+		//log.Printf("<%v>msg-data: "+
+		//	"token<%d>"+
+		//	"sn<%d>"+
+		//	"payload<%d>"+
+		//	"\n",
+		//	conn.cs,
+		//	token,
+		//	sn,
+		//	n-msgDataPayload,
+		//)
 	} else {
 		conn.readLock.Unlock()
 	}
-	log.Printf("<%v>msg-data: "+
-		"token<%d>"+
-		"sn<%d>"+
-		"payload<%d>"+
-		"\n",
-		conn.cs,
-		token,
-		sn,
-		n-msgDataPayload,
-	)
 }
 
 // 处理msgAck
@@ -714,8 +706,13 @@ func (this *RUDP) handleMsgAck(cs connCS, buf []byte, n int, addr *net.UDPAddr) 
 	sn := binary.BigEndian.Uint32(buf[msgAckSN:])
 	max_sn := binary.BigEndian.Uint32(buf[msgAckMaxSN:])
 	remains := binary.BigEndian.Uint32(buf[msgAckRemains:])
-	conn.writeLock.Lock()
+	ack_id := binary.BigEndian.Uint32(buf[msgAckId:])
+	if max_sn == 77 {
+		sn++
+		sn--
+	}
 	var ok bool
+	conn.writeLock.Lock()
 	if sn < max_sn {
 		ok = conn.rmWriteDataBefore(max_sn, remains)
 	} else {
@@ -728,19 +725,21 @@ func (this *RUDP) handleMsgAck(cs connCS, buf []byte, n int, addr *net.UDPAddr) 
 		case conn.writeable <- 1:
 		default:
 		}
+		log.Printf("<%v>msg-ack: "+
+			"token<%d>"+
+			"sn<%d>"+
+			"max sn<%d>"+
+			"remains<%d>"+
+			"id<%d>"+
+			"\n",
+			conn.cs,
+			token,
+			sn,
+			max_sn,
+			remains,
+			ack_id,
+		)
 	}
-	log.Printf("<%v>msg-ack: "+
-		"token<%d>"+
-		"sn<%d>"+
-		"max sn<%d>"+
-		"remains<%d>"+
-		"\n",
-		conn.cs,
-		token,
-		sn,
-		max_sn,
-		remains,
-	)
 }
 
 // 处理msgInvalid
@@ -799,7 +798,13 @@ func (this *RUDP) handleMsgPong(buf []byte, n int, addr *net.UDPAddr) {
 		return
 	}
 	// 读取msgPong字段
-	conn.readMsgPong(buf)
+	if conn.readMsgPong(buf) {
+		// 可写通知
+		select {
+		case conn.writeable <- 1:
+		default:
+		}
+	}
 	log.Printf("<%v>msg-pong: "+
 		"token<%d>"+
 		"ping id<%d>"+
