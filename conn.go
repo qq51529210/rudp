@@ -149,6 +149,7 @@ func (this *Conn) Read(b []byte) (int, error) {
 				return n, nil
 			}
 			if n < 0 {
+				this.Close()
 				return 0, io.EOF
 			}
 		}
@@ -286,7 +287,7 @@ func (this *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// 设置读缓存大小（字节）
+// 设置读缓存大小（字节），传输的速度由双方的rw最小缓存决定
 func (this *Conn) SetReadBuffer(n int) error {
 	this.readLock.Lock()
 	this.readQueueMaxLen = calcMaxLen(uint32(n), this.readMSS)
@@ -294,7 +295,7 @@ func (this *Conn) SetReadBuffer(n int) error {
 	return nil
 }
 
-// 设置写缓存大小（字节）
+// 设置写缓存大小（字节），传输的速度由双方的rw最小缓存决定
 func (this *Conn) SetWriteBuffer(n int) error {
 	this.writeLock.Lock()
 	this.writeQueueMaxLen = calcMaxLen(uint32(n), this.writeMSS)

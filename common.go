@@ -85,7 +85,7 @@ func (this *connKey) Init(addr *net.UDPAddr) {
 const (
 	defaultReadBuffer  = 1024 * 400 // Conn默认的读缓存大小
 	defaultWriteBuffer = 1024 * 400 // Conn默认的写缓存大小
-	defaultConnectRTO  = 100       // 客户端/服务端，建立连接，默认的发送超时，毫秒
+	defaultConnectRTO  = 100        // 客户端/服务端，建立连接，默认的发送超时，毫秒
 )
 
 const (
