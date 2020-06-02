@@ -707,16 +707,12 @@ func (this *RUDP) handleMsgAck(cs connCS, buf []byte, n int, addr *net.UDPAddr) 
 	max_sn := binary.BigEndian.Uint32(buf[msgAckMaxSN:])
 	remains := binary.BigEndian.Uint32(buf[msgAckRemains:])
 	//ack_id := binary.BigEndian.Uint32(buf[msgAckId:])
-	if max_sn == 77 {
-		sn++
-		sn--
-	}
 	var ok bool
 	conn.writeLock.Lock()
 	if sn < max_sn {
-		ok = conn.rmWriteDataBefore(max_sn, remains)
+		ok = conn.removeWriteDataBefore(max_sn, remains)
 	} else {
-		ok = conn.rmWriteData(sn, remains)
+		ok = conn.removeWriteData(sn, remains)
 	}
 	conn.writeLock.Unlock()
 	if ok {

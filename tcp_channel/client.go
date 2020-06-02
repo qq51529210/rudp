@@ -14,7 +14,8 @@ func runClient() {
 	listen := cmd.String("listen", "0.0.0.0:10000", "tcp_channel client tcp listen address")
 	server := cmd.String("server", "", "tcp_channel server udp listen address")
 	// 初始化
-	client, err := rudp.New(*listen)
+	rudp.DefaultConfig.Listen = *listen
+	client, err := rudp.NewWithConfig(&rudp.DefaultConfig)
 	if err != nil {
 		panic(err)
 	}

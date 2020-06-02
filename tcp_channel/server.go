@@ -2,8 +2,8 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/qq51529210/rudp"
-	"golang.org/x/tools/go/ssa/interp/testdata/src/fmt"
 	"io"
 	"net"
 )
@@ -13,7 +13,8 @@ func runServer() {
 	listen := cmd.String("listen", "0.0.0.0:10000", "tcp_channel server udp listen address")
 	proxy := cmd.String("proxy", "", "proxy tcp listen address")
 	// 初始化
-	server, err := rudp.New(*listen)
+	rudp.DefaultConfig.Listen = *listen
+	server, err := rudp.NewWithConfig(&rudp.DefaultConfig)
 	if err != nil {
 		panic(err)
 	}

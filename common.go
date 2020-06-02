@@ -58,14 +58,15 @@ type Config struct {
 // ipV4地址转ipV6整数时用
 const v4InV6Prefix = uint64(0xff)<<40 | uint64(0xff)<<32
 
-// ip地址作为map连接池的键
-type keyAddr struct {
-	ip1  uint64 // IPV6地址字符数组前64位
-	ip2  uint64 // IPV6地址字符数组后64位
-	port uint16 // 端口
+// 连接池的键，因为客户端可能在nat后面，所以加上token
+type connKey struct {
+	ip1   uint64 // IPV6地址字符数组前64位
+	ip2   uint64 // IPV6地址字符数组后64位
+	port  uint16 // 端口
+	token uint32 // token
 }
 
-func (this *keyAddr) Init(addr *net.UDPAddr) {
+func (this *connKey) Init(addr *net.UDPAddr) {
 	if len(addr.IP) == net.IPv4len {
 		this.ip1 = 0
 		this.ip2 = v4InV6Prefix |
@@ -80,23 +81,15 @@ func (this *keyAddr) Init(addr *net.UDPAddr) {
 	this.port = uint16(addr.Port)
 }
 
-// 连接池的键，因为客户端可能在nat后面，所以加上token
-type connKey struct {
-	keyAddr
-	//cToken uint16
-	//sToken uint16
-	token uint32
-}
-
 // 一些默认值
 const (
-	defaultReadBuffer  = 1024 * 40 // Conn默认的读缓存大小
-	defaultWriteBuffer = 1024 * 40 // Conn默认的写缓存大小
+	defaultReadBuffer  = 1024 * 400 // Conn默认的读缓存大小
+	defaultWriteBuffer = 1024 * 400 // Conn默认的写缓存大小
 	defaultConnectRTO  = 100       // 客户端/服务端，建立连接，默认的发送超时，毫秒
 )
 
 const (
-	maxConn = 1<<32 - 1 // 32位整数最大值
+	maxConn = 1<<32 - 1 // 最大连接数
 )
 
 type udpBuf [maxMSS]byte
@@ -104,10 +97,9 @@ type udpBuf [maxMSS]byte
 // 随机数
 var _rand = rand.New(rand.NewSource(time.Now().Unix()))
 
-// 为了避免分包，应该探测本地到对方的udp数据包最合适的mss
-// 这里返回最小值，可以重写这个函数来确定最大值
+// 为了避免分包，应该探测本地到对方的udp数据包最合适的mss，重写这个函数来确定最合适的值
 var DetectMSS = func(*net.UDPAddr) uint16 {
-	return minMSS
+	return maxMSS
 }
 
 // 计算队列最大长度

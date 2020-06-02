@@ -439,7 +439,7 @@ func (this *Conn) writeEOF() {
 }
 
 // 从队列中移除小于sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteDataBefore(sn, remains uint32) bool {
+func (this *Conn) removeWriteDataBefore(sn, remains uint32) bool {
 	// 检查sn是否在发送窗口范围
 	if this.writeQueueTail != this.writeQueueHead &&
 		this.writeQueueTail.sn < sn {
@@ -471,7 +471,7 @@ func (this *Conn) rmWriteDataBefore(sn, remains uint32) bool {
 }
 
 // 从队列中移除指定sn的数据包，返回true表示移除成功
-func (this *Conn) rmWriteData(sn, remains uint32) bool {
+func (this *Conn) removeWriteData(sn, remains uint32) bool {
 	// 检查sn是否在发送窗口范围
 	if this.writeQueueTail != this.writeQueueHead &&
 		this.writeQueueTail.sn < sn {
@@ -679,7 +679,7 @@ func (this *Conn) readMsgPong(buf []byte) bool {
 	this.readLock.Unlock()
 
 	this.writeLock.Lock()
-	ok := this.rmWriteDataBefore(binary.BigEndian.Uint32(buf[msgPongMaxSN:]),
+	ok := this.removeWriteDataBefore(binary.BigEndian.Uint32(buf[msgPongMaxSN:]),
 		binary.BigEndian.Uint32(buf[msgPongRemains:]))
 	this.writeLock.Unlock()
 	return ok
