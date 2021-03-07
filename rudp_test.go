@@ -13,14 +13,12 @@ func Test_RUDP_IO(t *testing.T) {
 	wait := sync.WaitGroup{}
 	wait.Add(2)
 	// server
-	DefaultConfig.Listen = "127.0.0.1:10000"
-	server, err := NewWithConfig(&DefaultConfig)
+	server, err := Listen("127.0.0.1:10000")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// client
-	DefaultConfig.Listen = "127.0.0.1:20000"
-	client, err := NewWithConfig(&DefaultConfig)
+	client, err := Listen("127.0.0.1:10000")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +34,7 @@ func Test_RUDP_IO(t *testing.T) {
 			t.Fatal(err)
 		}
 		//t.Log("conn from", conn.RemoteAddr())
-		var buf udpBuf
+		var buf [maxMSS]byte
 		for {
 			// 读取数据
 			n, err := conn.Read(buf[:])
@@ -68,7 +66,7 @@ func Test_RUDP_IO(t *testing.T) {
 		// 1024*10240，10m的数据
 		for i := 0; i < n; i++ {
 			// 随机数据
-			_rand.Read(buf)
+			mathRand.Read(buf)
 			// 写入哈希
 			wh.Write(buf)
 			// 发送
