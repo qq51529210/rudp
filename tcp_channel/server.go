@@ -3,9 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/qq51529210/rudp"
 	"io"
 	"net"
+
+	"github.com/qq51529210/rudp"
 )
 
 func runServer() {
@@ -13,8 +14,7 @@ func runServer() {
 	listen := cmd.String("listen", "0.0.0.0:10000", "tcp_channel server udp listen address")
 	proxy := cmd.String("proxy", "", "proxy tcp listen address")
 	// 初始化
-	rudp.DefaultConfig.Listen = *listen
-	server, err := rudp.NewWithConfig(&rudp.DefaultConfig)
+	server, err := rudp.Listen(*listen)
 	if err != nil {
 		panic(err)
 	}

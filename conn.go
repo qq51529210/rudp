@@ -3,119 +3,89 @@ package rudp
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
-	"math/big"
 	"net"
 	"sync"
 	"time"
 )
 
 const (
-	closedState     = iota // 关闭的连接
-	connectingState        // 正在发起连接
-	connectedState         // 已经确认连接
-	closingState           // 正在关闭的连接
+	closedState  = iota // 关闭的连接
+	dialState           // 正在建立连接，client & server
+	connectState        // 已经确认连接，client & server
+	closingState        // 正在关闭连接
 )
 
 var (
-	diffieHellmanP = big.NewInt(0)
-	diffieHellmanG = big.NewInt(0)
-	readDataPool   sync.Pool
-	writeDataPool  sync.Pool
-	emptyData      []byte
+	emptyData     = make([]byte, 0) // 空数据
+	readDataPool  sync.Pool         // readData pool
+	writeDataPool sync.Pool         // writeData pool
 )
 
 func init() {
-	readDataPool.New = func() interface{} { return new(readData) }
-	writeDataPool.New = func() interface{} { return new(writeData) }
-	diffieHellmanP.SetBytes([]byte("RUDP DIFFIE-HELLMAN KEY EXCHANGE"))
-	diffieHellmanG.SetBytes([]byte("rudp diffie-hellman key exchange"))
-}
-
-// 判断两个udp地址是否相同
-func isAddressEqual(a1, a2 *net.UDPAddr) bool {
-	return bytes.Compare(a1.IP.To16(), a2.IP.To16()) == 0 && a1.Port == a2.Port
-}
-
-// 计算队列最大长度
-func calcQueueCap(bytes, mss int) int {
-	// 计算数据块队列的长度
-	if bytes < mss {
-		return 1
+	readDataPool.New = func() interface{} {
+		return new(readData)
 	}
-	// 长度=字节/mss
-	max := bytes / mss
-	// 不能整除，+1
-	if bytes%mss != 0 {
-		max++
+	writeDataPool.New = func() interface{} {
+		return new(writeData)
 	}
-	return max
 }
 
-// Conn接收队列数据包
+// readQueue的数据块
 type readData struct {
-	sn   uint32    // 序号
-	data []byte    // 数据
-	idx  uint16    // 有效数据的起始，因为read有可能一次读不完数据
-	next *readData // 下一个
+	sn          uint16       // 序号
+	data        [maxMSS]byte // 数据
+	len         uint16       // 数据大小
+	discardable bool         // 是否可丢弃
+	idx         uint16       // 有效数据的起始，因为read有可能一次读不完数据
+	next        *readData    // 下一个
 }
 
-// Conn发送队列数据包
+// writeQueue的数据块
 type writeData struct {
-	sn    uint32     // 序号
-	data  []byte     // 数据
-	len   uint16     // 数据大小，因为write有可能写不完数据块
-	next  *writeData // 下一个
-	first int64      // 第一次被发送的时间，用于计算rtt
-	last  int64      // 上一次被发送的时间，超时重发判断
+	sync.RWMutex
+	discardable bool       // 可以丢弃
+	sn          uint16     // 序号
+	buff        []byte     // 数据
+	len         uint16     // 数据大小，因为write有可能写不完数据块
+	next        *writeData // 下一个
+	first       time.Time  // 第一次被发送的时间，用于计算rtt
+	last        time.Time  // 上一次被发送的时间，超时重发判断
 }
 
 type Conn struct {
-	segmentType        byte          // 是client还是server
-	state              byte          // 状态，closeState/connectingState/connectedState
-	lock               sync.RWMutex  // 同步锁
-	quit               chan struct{} // 关闭的信号
-	localEnableFEC     bool          // local是否开启纠错
-	remoteEnableFEC    bool          // remote是否开启纠错
-	localEnableCrypto  bool          // local是否开启加密
-	remoteEnableCrypto bool          // remote是否开启加密
-	localListenAddr    *net.UDPAddr  // local监听地址
-	remoteListenAddr   *net.UDPAddr  // remote监听地址
-	localInternetAddr  *net.UDPAddr  // local互联网地址
-	remoteInternetAddr *net.UDPAddr  // remote互联网地址
-	localAckSN         uint32        // 发送ack的次数，递增，收到新的max sn时，重置为0
-	remoteAckSN        uint32        // remoteack的次数，用于判断更新remote的接收队列空闲长度
-	readBytes          uint64        // read的总字节
-	writeBytes         uint64        // write的总字节
-	readTime           int64         // 上一次读取有效数据的时间戳
-	readLock           sync.RWMutex  // 读缓存锁
-	readable           chan int      // 可读通知
-	readTimeout        time.Time     // 应用层设置的io读超时
-	readQueue          *readData     // 接收队列，第一个数据包，仅仅作为指针
-	readQueueLen       int           // 接收队列长度
-	readQueueCap       int           // 接收队列最大长度
-	readNextSN         uint16        // 接收队列接收到的连续的数据包最大序号
-	readMinSN          uint16        // 接收队列最小序号，接收窗口控制
-	readMaxSN          uint16        // 接收队列最大序号，接收窗口控制
-	readMSS            uint16        // 接收队列的每个数据包的大小（remote的发送队列数据包大小）
-	writeLock          sync.RWMutex  // 写缓存锁
-	writeTimeout       time.Time     // 应用层设置的io写超时
-	writeable          chan int      // 可写通知
-	writeQueueHead     *writeData    // 发送队列，第一个数据包，仅仅作为指针
-	writeQueueTail     *writeData    // 发送队列，最后一个数据包
-	writeQueueLen      int           // 发送队列长度
-	writeQueueCap      int           // 发送队列最大长度
-	writeSN            uint32        // 发送队列的最大sn
-	writeMSS           uint16        // 发送队列的每个数据包的大小
-	writeMax           uint32        // remote读缓存队列剩余长度，发送窗口控制
-	rto                time.Duration // 超时重发
-	rtt                time.Duration // 实时RTT，用于计算rto
-	rttVar             time.Duration // 平均RTT，用于计算rto
-	minRTO             time.Duration // 最小rto，不要出现"过快"
-	maxRTO             time.Duration // 最大rto，不要出现"假死"
-	cToken             uint32        // 客户端token
-	sToken             uint32        // 服务端token
-	pingId             uint32        // ping消息的id，递增
+	rudp          *RUDP
+	from          byte            // 0:client，1:server
+	token         uint32          // 连接token
+	lock          sync.RWMutex    // 同步锁
+	state         byte            // 状态
+	quitSignal    chan struct{}   // close退出的信号
+	connectSignal chan struct{}   // 建立连接的信号
+	timestamp     uint64          // 连接的时间戳
+	fec           bool            // 是否开启纠错
+	crypto        bool            // 是否开启加密
+	listenAddr    [2]*net.UDPAddr // 监听地址，0:local，1:remote
+	internetAddr  [2]*net.UDPAddr // 互联网地址，0:local，1:remote
+	ackSN         [2]uint32       // 发送ack的次数，递增，收到新的max sn时，重置为0。0:local，1:remote
+	ioBytes       [2]uint64       // read/write的总字节
+	handleQueue   chan *segment   // 待处理的数据缓存
+	diffieHellman *diffieHellman  // 交换密钥算法
+	readTime      time.Time       // 读取有效数据块的时间
+	dataLock      [2]sync.RWMutex // 读/写队列锁
+	ioTimeout     [2]time.Time    // 应用层设置的io读/写超时
+	ioEnable      [2]chan byte    // 可读/写通知
+	dataLen       [2]uint16       // 读/写队列长度
+	dataCap       [2]uint16       // 读/写队列最大长度
+	sn            [2]uint16       // 0:最大连续序号，小于sn的数据块是可读的。1:下一个数据块的sn
+	discardSN     [2]uint16       // 0:读队列期待的下一个丢弃数据segment的sn。1:下一个丢弃数据segment的sn
+	mss           [2]uint16       // 0:读队列的mss参考。1:发送数据块的大小
+	readDataHead  *readData       // 接收队列，第一个数据块，仅仅作为指针
+	writeDataHead *writeData      // 第一个数据块
+	writeDataTail *writeData      // 最后一个数据块，添加时直接添加到末尾
+	writeDataMax  uint16          // 发送窗口控制，最多能发多少个segment
+	rto           rto             // 超时重发
+	discardSeg    *segment        // discard segment，不为nil表示要发送
 }
 
 // 返回net.OpError
@@ -123,28 +93,29 @@ func (c *Conn) netOpError(op string, err error) error {
 	return &net.OpError{
 		Op:     op,
 		Net:    "udp",
-		Source: c.remoteInternetAddr,
-		Addr:   c.localListenAddr,
+		Source: c.internetAddr[1],
+		Addr:   c.listenAddr[0],
 		Err:    err,
 	}
 }
 
 // net.Conn接口
 func (c *Conn) Read(b []byte) (int, error) {
+	n := 0
 	// 没有设置超时
-	c.readLock.RLock()
-	if c.readTimeout.IsZero() {
-		c.readLock.RUnlock()
+	c.dataLock[0].RLock()
+	if c.ioTimeout[0].IsZero() {
+		c.dataLock[0].RUnlock()
 		for {
-			c.readLock.Lock()
-			n := c.read(b)
-			c.readLock.Unlock()
+			c.dataLock[0].Lock()
+			n = c.read(b)
+			c.dataLock[0].Unlock()
 			if n == 0 {
 				select {
-				case <-c.readable:
+				case <-c.ioEnable[0]:
 					continue
-				case <-c.closed:
-					return 0, c.netOpError("read", closeErr("conn"))
+				case <-c.quitSignal:
+					return 0, c.netOpError("read", errors.New("conn hash been closed"))
 				}
 			}
 			if n > 0 {
@@ -157,23 +128,23 @@ func (c *Conn) Read(b []byte) (int, error) {
 		}
 	}
 	// 设置了超时
-	duration := c.readTimeout.Sub(time.Now())
-	c.readLock.RUnlock()
+	duration := c.ioTimeout[0].Sub(time.Now())
+	c.dataLock[0].RUnlock()
 	if duration <= 0 {
-		return 0, c.netOpError("read", opErr("timeout"))
+		return 0, c.netOpError("read", new(timeoutError))
 	}
 	for {
-		c.readLock.Lock()
-		n := c.read(b)
-		c.readLock.Unlock()
+		c.dataLock[0].Lock()
+		n = c.read(b)
+		c.dataLock[0].Unlock()
 		if n == 0 {
 			select {
-			case <-c.readable:
+			case <-c.ioEnable[0]:
 				continue
-			case <-c.closed:
-				return 0, c.netOpError("read", closeErr("conn"))
+			case <-c.quitSignal:
+				return 0, c.netOpError("read", connClosedError)
 			case <-time.After(duration):
-				return 0, c.netOpError("read", opErr("timeout"))
+				return 0, c.netOpError("read", new(timeoutError))
 			}
 		}
 		if n > 0 {
@@ -185,23 +156,130 @@ func (c *Conn) Read(b []byte) (int, error) {
 	}
 }
 
+// 读取连续的数据，返回0表示没有数据，返回-1表示io.EOF
+func (c *Conn) read(b []byte) int {
+	n, m := 0, 0
+	for c.readDataHead != nil {
+		// 有数据块，但是没有数据，表示io.EOF
+		if len(c.readDataHead.data) == 0 {
+			// 前面的数据块都有数据，先返回前面的
+			if n > 0 {
+				return n
+			}
+			// 前面没有数据
+			c.removeReadDataFront()
+			return -1
+		}
+		// 拷贝数据到buf
+		m = copy(b[n:], c.readDataHead.data[c.readDataHead.idx:])
+		n += m
+		c.readDataHead.idx += uint16(m)
+		// 数据块数据拷贝完了，从队列中移除
+		if c.readDataHead.idx == uint16(len(c.readDataHead.data)) {
+			c.removeReadDataFront()
+		}
+		// buf满了
+		if n == len(b) {
+			return n
+		}
+	}
+	return n
+}
+
+// 移除第一个数据块
+func (c *Conn) removeReadDataFront() {
+	d := c.readDataHead
+	c.readDataHead = c.readDataHead.next
+	c.dataLen[0]--
+	readDataPool.Put(d)
+}
+
+// 尝试添加一个数据块，成功返回true
+func (c *Conn) addReadData(sn uint16, data []byte) bool {
+	// 是否在接收范围
+	if sn < c.sn[0] || sn >= c.dataCap[0]+c.sn[0] {
+		return false
+	}
+	// 按sn顺序放到队列中
+	p := c.readDataHead
+	for p != nil {
+		// 重复数据
+		if sn == p.sn {
+			return false
+		}
+		// 插入
+		if sn < p.sn {
+			break
+		}
+		p = p.next
+	}
+	// 新的数据块
+	d := readDataPool.Get().(*readData)
+	d.sn = sn
+	d.idx = 0
+	d.len = uint16(copy(d.data[:], data))
+	d.next = p
+	c.dataLen[0]++
+	if p == c.readDataHead {
+		c.readDataHead = d
+	}
+	// 更新有效数据的读时间
+	c.readTime = time.Now()
+	// 检查连续的sn
+	p = c.readDataHead
+	for p != nil && p.sn == c.sn[0] {
+		c.sn[0]++
+		p = p.next
+	}
+	return true
+}
+
+// 丢弃数据
+func (c *Conn) discardReadData(sn, begin, end uint16) {
+
+}
+
+func (c *Conn) releaseReadData() {
+	p := c.readDataHead
+	for p != nil {
+		d := p
+		p = p.next
+		readDataPool.Put(d)
+	}
+}
+
 // net.Conn接口
 func (c *Conn) Write(b []byte) (int, error) {
+	return c.write(b, false)
+}
+
+// 写入可丢弃的数据
+func (c *Conn) WriteDiscardable(b []byte) (int, error) {
+	return c.write(b, true)
+}
+
+// 丢弃最早的一段可丢弃的数据
+func (c *Conn) DiscardWriteData() {
+
+}
+
+// 写入数据到缓存
+func (c *Conn) write(b []byte, discardable bool) (int, error) {
 	// 没有设置超时
-	m := 0
-	c.writeLock.RLock()
-	if c.writeTimeout.IsZero() {
-		c.writeLock.RUnlock()
+	m, n := 0, 0
+	c.dataLock[1].RLock()
+	if c.ioTimeout[1].IsZero() {
+		c.dataLock[1].RUnlock()
 		for {
-			c.writeLock.Lock()
-			n := c.write(b[m:])
-			c.writeLock.Unlock()
+			c.dataLock[1].Lock()
+			n = c.addWriteData(b[m:], discardable)
+			c.dataLock[1].Unlock()
 			if n == 0 {
 				select {
-				case <-c.writeable:
+				case <-c.ioEnable[1]:
 					continue
-				case <-c.closed:
-					return 0, c.netOpError("write", closeErr("conn"))
+				case <-c.quitSignal:
+					return 0, c.netOpError("write", connClosedError)
 				}
 			}
 			m += n
@@ -211,23 +289,23 @@ func (c *Conn) Write(b []byte) (int, error) {
 		}
 	}
 	// 设置了超时
-	duration := c.writeTimeout.Sub(time.Now())
-	c.writeLock.RUnlock()
+	duration := c.ioTimeout[1].Sub(time.Now())
+	c.dataLock[1].RUnlock()
 	if duration <= 0 {
-		return 0, c.netOpError("write", opErr("timeout"))
+		return 0, c.netOpError("write", new(timeoutError))
 	}
 	for {
-		c.writeLock.Lock()
-		n := c.write(b[m:])
-		c.writeLock.Unlock()
+		c.dataLock[1].Lock()
+		n = c.addWriteData(b[m:], discardable)
+		c.dataLock[1].Unlock()
 		if n == 0 {
 			select {
-			case <-c.writeable:
+			case <-c.ioEnable[1]:
 				continue
-			case <-c.closed:
-				return 0, c.netOpError("write", closeErr("conn"))
+			case <-c.quitSignal:
+				return 0, c.netOpError("write", connClosedError)
 			case <-time.After(duration):
-				return 0, c.netOpError("write", opErr("timeout"))
+				return 0, c.netOpError("write", new(timeoutError))
 			}
 		}
 		m += n
@@ -237,29 +315,180 @@ func (c *Conn) Write(b []byte) (int, error) {
 	}
 }
 
+func (c *Conn) newWriteData(discardable bool) *writeData {
+	d := writeDataPool.Get().(*writeData)
+	d.discardable = discardable
+	d.sn = c.sn[1]
+	c.sn[1]++
+	d.next = nil
+	d.first = time.Time{}
+	d.buff[segmentType] = dataSegment[c.from]
+	binary.BigEndian.PutUint32(d.buff[dataSegmentToken:], c.token)
+	binary.BigEndian.PutUint16(d.buff[dataSegmentSN:], d.sn)
+	d.len = dataSegmentPayload
+	c.dataLen[1]++
+	return d
+}
+
+func (c *Conn) newDiscardData(begin, end uint16) {
+	c.discardSeg = segmentPool.Get().(*segment)
+	c.discardSeg.b[segmentType] = discardSegment[c.from]
+	binary.BigEndian.PutUint32(c.discardSeg.b[discardSegmentToken:], c.token)
+	binary.BigEndian.PutUint16(c.discardSeg.b[discardSegmentSN:], c.discardSN[1])
+	binary.BigEndian.PutUint16(c.discardSeg.b[discardSegmentBegin:], begin)
+	binary.BigEndian.PutUint16(c.discardSeg.b[discardSegmentEnd:], end)
+	c.discardSN[1]++
+}
+
+// 写入数据，返回0表示队列满了无法写入
+func (c *Conn) addWriteData(data []byte, discardable bool) int {
+	// 还能添加多少个数据包
+	free := c.dataCap[1] - c.dataLen[1]
+	if free <= 0 {
+		return 0
+	}
+	n, m := 0, 0
+	if c.writeDataHead == nil {
+		// 队列中没有数据，添加到第一
+		c.writeDataHead = c.newWriteData(discardable)
+		c.writeDataTail = c.writeDataHead
+		m = copy(c.writeDataTail.buff[c.writeDataTail.len:c.mss[1]], data)
+		c.writeDataTail.len += uint16(m)
+		free--
+		n += m
+		data = data[m:]
+	} else {
+		// 检查最后一个数据包是否"满数据"
+		if c.writeDataTail.len < c.mss[1] && // 有可以写的空间
+			c.writeDataTail.first.IsZero() && // 没有被发送
+			c.writeDataTail.discardable == discardable { // 一样的数据类型
+			m = copy(c.writeDataTail.buff[c.writeDataTail.len:c.mss[1]], data)
+			c.writeDataTail.len += uint16(m)
+			n += m
+			data = data[m:]
+		}
+	}
+	// 新的数据包
+	for free > 0 && len(data) > 0 {
+		c.writeDataTail.next = c.newWriteData(discardable)
+		c.writeDataTail = c.writeDataTail.next
+		m = copy(c.writeDataTail.buff[c.writeDataTail.len:c.mss[1]], data)
+		c.writeDataTail.len += uint16(m)
+		free--
+		n += m
+		data = data[m:]
+	}
+	return n
+}
+
+// 移除sn前面的所有数据包
+func (c *Conn) removeWriteDataBefore(sn uint16) bool {
+	// 检查sn是否在发送窗口范围
+	if c.writeDataHead == nil || sn < c.writeDataHead.sn || sn > c.writeDataTail.sn {
+		return false
+	}
+	// 遍历发送队列数据包
+	data := c.writeDataHead
+	for {
+		// 因为是递增有序队列，sn如果小于当前，就没必要继续
+		if sn < data.sn {
+			break
+		}
+		// 计算rto
+		if sn == data.sn {
+			c.rto.Calculate(time.Now().Sub(data.first))
+		}
+		next := data.next
+		writeDataPool.Put(data)
+		data = next
+		c.dataLen[1]--
+		if data == nil {
+			c.writeDataTail = nil
+			break
+		}
+	}
+	c.writeDataHead = data
+	return true
+}
+
+// 移除指定sn数据包，成功返回true
+func (c *Conn) removeWriteData(sn uint16) bool {
+	// 检查sn是否在发送窗口范围
+	if c.writeDataHead == nil || sn < c.writeDataHead.sn || sn > c.writeDataTail.sn {
+		return false
+	}
+	// 遍历发送队列数据块
+	if sn == c.writeDataHead.sn {
+		// 计算rto
+		c.rto.Calculate(time.Now().Sub(c.writeDataHead.first))
+		// 从队列移除
+		temp := c.writeDataHead
+		c.writeDataHead = c.writeDataHead.next
+		if c.writeDataHead == nil {
+			c.writeDataTail = nil
+		}
+		writeDataPool.Put(temp)
+		c.dataLen[1]--
+		return true
+	}
+	prev := c.writeDataHead
+	p := prev.next
+	for p != nil {
+		// 因为是递增有序队列，sn如果小于当前，就没必要继续
+		if sn < p.sn {
+			return false
+		}
+		if sn == p.sn {
+			// 计算rto
+			c.rto.Calculate(time.Now().Sub(p.first))
+			// 从队列移除
+			prev.next = p.next
+			// 移除的是最后一个
+			if p == c.writeDataTail {
+				c.writeDataTail = prev
+			}
+			writeDataPool.Put(p)
+			c.dataLen[1]--
+			return true
+		}
+		prev = p
+		p = prev.next
+	}
+	return false
+}
+
+func (c *Conn) releaseWriteData() {
+	p := c.writeDataHead
+	for p != nil {
+		d := p
+		p = p.next
+		writeDataPool.Put(d)
+	}
+}
+
 // net.Conn接口
 func (c *Conn) Close() error {
 	// 修改状态
 	c.lock.Lock()
 	if c.state == closedState || c.state == closingState {
 		c.lock.Unlock()
-		return c.netOpError("close", closeErr("conn"))
+		return c.netOpError("close", connClosedError)
 	}
 	c.state = closingState
 	c.lock.Unlock()
 	// 写入0数据，表示eof
-	c.write(emptyData)
+	c.write(emptyData, false)
 	return nil
 }
 
 // net.Conn接口
 func (c *Conn) LocalAddr() net.Addr {
-	return c.localListenAddr
+	return c.listenAddr[0]
 }
 
 // net.Conn接口
 func (c *Conn) RemoteAddr() net.Addr {
-	return c.remoteInternetAddr
+	return c.internetAddr[1]
 }
 
 // net.Conn接口
@@ -271,387 +500,101 @@ func (c *Conn) SetDeadline(t time.Time) error {
 
 // net.Conn接口
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	c.readLock.Lock()
-	c.readTimeout = t
-	c.readLock.Unlock()
+	c.dataLock[0].Lock()
+	c.ioTimeout[0] = t
+	c.dataLock[0].Unlock()
 	return nil
 }
 
 // net.Conn接口
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.writeLock.Lock()
-	c.writeTimeout = t
-	c.writeLock.Unlock()
-	return nil
-}
-
-// 设置读缓存大小（字节），传输的速度由双方的rw最小缓存决定
-func (c *Conn) SetReadBuffer(n int) error {
-	if n < 0 {
-		n = defaultReadBuffer
-	}
-	c.readLock.Lock()
-	c.readQueueCap = calcQueueCap(n, int(c.readMSS))
-	c.readLock.Unlock()
-	return nil
-}
-
-// 设置写缓存大小（字节），传输的速度由双方的rw最小缓存决定
-func (c *Conn) SetWriteBuffer(n int) error {
-	if n < 0 {
-		n = defaultWriteBuffer
-	}
-	c.writeLock.Lock()
-	c.writeQueueCap = calcQueueCap(n, int(c.writeMSS))
-	c.writeLock.Unlock()
+	c.dataLock[1].Lock()
+	c.ioTimeout[1] = t
+	c.dataLock[1].Unlock()
 	return nil
 }
 
 // local的公网地址
 func (c *Conn) LocalInternetAddr() net.Addr {
-	return c.localInternetAddr
+	return c.internetAddr[0]
 }
 
 // remote的监听地址
 func (c *Conn) RemoteListenAddr() net.Addr {
-	return c.remoteListenAddr
+	return c.listenAddr[1]
 }
 
 // local地址是否nat(Network Address Translation)
 func (c *Conn) IsNat() bool {
-	return isAddressEqual(c.localInternetAddr, c.localListenAddr)
+	return bytes.Compare(c.internetAddr[0].IP.To16(), c.listenAddr[0].IP.To16()) == 0 &&
+		c.internetAddr[0].Port == c.listenAddr[0].Port
 }
 
 // remote地址是否在nat(Network Address Translation)
 func (c *Conn) IsRemoteNat() bool {
-	return isAddressEqual(c.remoteInternetAddr, c.remoteListenAddr)
-}
-
-// // 返回一个初始化的readData
-// func (c *Conn) newReadData(sn uint32, b []byte, next *readData) *readData {
-// 	d := readDataPool.Get().(*readData)
-// 	d.sn = sn
-// 	d.idx = 0
-// 	d.b = d.b[:0]
-// 	d.b = append(d.b, b...)
-// 	d.next = next
-// 	c.readQueueLen++
-// 	return d
-// }
-
-// 在发送队列末尾，添加一个初始化的writeData
-func (c *Conn) newWriteData() *writeData {
-	d := writeDataPool.Get().(*writeData)
-	d.sn = c.writeSN
-	d.next = nil
-	d.first = 0
-	d.data = d.data[:1]
-	d.data[0] = c.segmentType | dataSegment
-	binary.BigEndian.PutUint32(d.data[dataSegmentToken:], c.sToken)
-	binary.BigEndian.PutUint32(d.data[dataSegmentSN:], d.sn)
-	d.len = dataSegmentPayload
-	c.writeSN++
-	c.writeQueueLen++
-	return d
-}
-
-func (c *Conn) freeReadData() {
-	d := c.readQueue
-	c.readQueue = c.readQueue.next
-	c.readQueueLen--
-	readDataPool.Put(d)
-}
-
-// 读取连续的数据，返回0表示没有数据，返回-1表示io.EOF
-func (c *Conn) read(b []byte) int {
-	// 没有数据
-	if c.readQueueLen < 1 {
-		return 0
-	}
-	n, m := 0, 0
-	for c.readQueue != nil {
-		// 有数据包，但是没有数据，表示io.EOF
-		if len(c.readQueue.data) == 0 {
-			// 前面的数据包都有数据，先返回前面的
-			if n > 0 {
-				return n
-			}
-			// 前面没有数据
-			c.freeReadData()
-			c.readQueue = nil
-			return -1
-		}
-		// 拷贝数据到buf
-		m = copy(b[n:], c.readQueue.data[c.readQueue.idx:])
-		n += m
-		c.readQueue.idx += uint16(m)
-		// 数据包数据拷贝完了，从队列中移除
-		if c.readQueue.idx == uint16(len(c.readQueue.data)) {
-			c.freeReadData()
-			c.readMinSN++
-			c.readMaxSN++
-		}
-		// buf满了
-		if n == len(b) {
-			return n
-		}
-	}
-	return n
-}
-
-// 写入数据到发送队列，返回0表示队列满了无法写入
-func (c *Conn) write(b []byte) int {
-	// 还能添加多少个数据包
-	free := c.writeQueueCap - c.writeQueueLen
-	if free <= 0 {
-		return 0
-	}
-	// 加密
-	if c.localCrypto {
-
-	}
-	// 纠错
-	if c.localFEC {
-
-	}
-	n, m := 0, 0
-	if c.writeQueueHead == nil {
-		c.writeQueueHead = c.newWriteData()
-		c.writeQueueTail = c.writeQueueHead
-		m = copy(c.writeQueueTail.data[c.writeQueueTail.len:c.writeMSS], b)
-		c.writeQueueTail.len += uint16(m)
-		free--
-		n += m
-		b = b[m:]
-	} else {
-		// 检查最后一个数据包是否"满数据"
-		if c.writeQueueTail.len < c.writeMSS && // 有可以写的空间
-			c.writeQueueTail.first == 0 { // 没有被发送
-			m = copy(c.writeQueueTail.data[c.writeQueueTail.len:c.writeMSS], b)
-			c.writeQueueTail.len += uint16(m)
-			n += m
-			b = b[m:]
-		}
-	}
-	// 新的数据包
-	for free > 0 && len(b) > 0 {
-		c.writeQueueTail.next = c.newWriteData()
-		c.writeQueueTail = c.writeQueueTail.next
-		m = copy(c.writeQueueTail.data[c.writeQueueTail.len:c.writeMSS], b)
-		c.writeQueueTail.len += uint16(m)
-		free--
-		n += m
-		b = b[m:]
-	}
-	return n
-}
-
-// 从队列中移除小于sn的数据包，返回true表示移除成功
-func (c *Conn) removeWriteDataBefore(sn, remains uint32) bool {
-	// 检查sn是否在发送窗口范围
-	if c.writeQueueTail != c.writeQueueHead &&
-		c.writeQueueTail.sn < sn {
-		return false
-	}
-	// 遍历发送队列数据包
-	cur := c.writeQueueHead.next
-	if cur != nil && cur.sn > sn {
-		return false
-	}
-	now := time.Now()
-	for cur != nil {
-		if cur.sn >= sn {
-			break
-		}
-		// rto
-		c.calcRTO(now.Sub(cur.first))
-		next := cur.next
-		writeDataPool.Put(cur)
-		cur = next
-		c.writeQueueLen--
-	}
-	c.writeQueueHead.next = cur
-	if cur == nil {
-		c.writeQueueTail = c.writeQueueHead
-	}
-	c.writeMax = remains
-	return true
-}
-
-// 从队列中移除指定sn的数据包，返回true表示移除成功
-func (c *Conn) removeWriteData(sn, remains uint32) bool {
-	// 检查sn是否在发送窗口范围
-	if c.writeQueueTail != c.writeQueueHead &&
-		c.writeQueueTail.sn < sn {
-		return false
-	}
-	// 遍历发送队列数据包
-	prev := c.writeQueueHead
-	cur := prev.next
-	for cur != nil {
-		// 因为是递增有序队列，sn如果小于当前，就没必要继续
-		if sn < cur.sn {
-			return false
-		}
-		if sn == cur.sn {
-			// rto
-			c.calcRTO(time.Now().Sub(cur.first))
-			// 从队列移除
-			prev.next = cur.next
-			if cur == c.writeQueueTail {
-				c.writeQueueTail = prev
-			}
-			writeDataPool.Put(cur)
-			c.writeQueueLen--
-			c.writeMax = remains
-			return true
-		}
-		prev = cur
-		cur = prev.next
-	}
-	return false
-}
-
-// 移除第一个数据包
-func (c *Conn) rmFrontReadData() {
-	cur := c.readQueue.next
-	c.readQueue.next = cur.next
-	readDataPool.Put(cur)
-	c.readQueueLen--
+	return bytes.Compare(c.internetAddr[1].IP.To16(), c.listenAddr[1].IP.To16()) == 0 &&
+		c.internetAddr[1].Port == c.listenAddr[1].Port
 }
 
 // 检查发送队列，超时重发
-func (c *Conn) writeToUDP(out func(data []byte), now time.Time) {
-	// 需要发送的数据包个数
-	n := c.writeQueueLen
-	// 没有数据
-	if n < 1 {
-		return
-	}
-	// 不能超过最大发送个数
-	if n > c.writeMax {
-		n = c.writeMax
-	}
-	// 如果remote没有接收空间，发1个
-	if n == 0 {
-		n = 1
-	}
-	// 开始遍历发送队列
-	prev := c.writeQueueHead
-	cur := prev.next
-	for cur != nil && n > 0 {
-		// 第一次发送
-		if cur.first.IsZero() {
-			out(cur.b[:cur.len])
-			// 记录时间
-			cur.first = now
-			cur.last = now
-			n--
-		} else if now.Sub(cur.last) >= cur.rto {
-			out(cur.b[:cur.len])
-			// 记录时间
-			cur.last = now
-			n--
-			// rto加大
-			cur.rto += c.rto / 2
-			if c.maxRTO != 0 && cur.rto > c.maxRTO {
-				cur.rto = c.maxRTO
-			}
-		}
-		cur = cur.next
-	}
+func (c *Conn) retransmission(now *time.Time) {
+	// // 需要发送的数据包个数
+	// n := c.writeQueueLen
+	// // 没有数据
+	// if n < 1 {
+	// 	return
+	// }
+	// // 不能超过最大发送个数
+	// if n > c.writeMax {
+	// 	n = c.writeMax
+	// }
+	// // 如果remote没有接收空间，发1个
+	// if n == 0 {
+	// 	n = 1
+	// }
+	// // 开始遍历发送队列
+	// prev := c.writeQueueHead
+	// cur := prev.next
+	// for cur != nil && n > 0 {
+	// 	// 第一次发送
+	// 	if cur.first.IsZero() {
+	// 		out(cur.b[:cur.len])
+	// 		// 记录时间
+	// 		cur.first = now
+	// 		cur.last = now
+	// 		n--
+	// 	} else if now.Sub(cur.last) >= cur.rto {
+	// 		out(cur.b[:cur.len])
+	// 		// 记录时间
+	// 		cur.last = now
+	// 		n--
+	// 		// rto加大
+	// 		cur.rto += c.rto / 2
+	// 		if c.maxRTO != 0 && cur.rto > c.maxRTO {
+	// 			cur.rto = c.maxRTO
+	// 		}
+	// 	}
+	// 	cur = cur.next
+	// }
 }
 
-// 添加udp数据包，返回true表示在接收范围内，需要返回ack
-func (c *Conn) readFromUDP(sn uint16, b []byte) bool {
-	// 是否在接收范围
-	if sn < c.readMinSN || sn >= c.readMaxSN {
-		return false
-	}
-	// 遍历接收队列
-	prev := c.readQueue
-	cur := prev.next
-	for cur != nil {
-		// 重复数据
-		if sn == cur.sn {
-			return true
-		}
-		// 插入
-		if sn < cur.sn {
-			break
-		}
-		// 检查下一个
-		prev = cur
-		cur = prev.next
-	}
-	prev.next = c.newReadData(sn, b, cur)
-	// 检查连续的sn
-	cur = prev.next
-	for cur != nil && cur.sn == c.readNextSN {
-		c.readNextSN++
-		cur = cur.next
-	}
-	// 更新有效数据的读时间
-	c.readTime = time.Now()
-	return true
-}
-
-// 根据实时的rtt来计算rto，使用的是tcp那套算法
-func (c *Conn) calcRTO(rtt time.Duration) {
-	c.rttVar = (3*c.rttVar + c.rtt - rtt) / 4
-	c.rtt = (7*c.rtt + rtt) / 8
-	c.rto = c.rtt + 4*c.rttVar
-	if c.minRTO != 0 && c.rto < c.minRTO {
-		c.rto = c.minRTO
-	}
-	if c.maxRTO != 0 && c.rto > c.maxRTO {
-		c.rto = c.maxRTO
-	}
-}
-
-// t: connectSegmentType
-func (c *Conn) encConnectSegment(b []byte, t byte) {
-	b[segmentHeader] = cmdSegment | c.segmentType
-	b[cmdSegmentType] = t
-	b[connectSegmentVersion] = protolVersion
-	binary.BigEndian.PutUint32(b[connectSegmentClientToken:], c.cToken)
-	binary.BigEndian.PutUint32(b[connectSegmentServerToken:], c.sToken)
-	copy(b[connectSegmentLocalIP:], c.localListenAddr.IP.To16())
-	binary.BigEndian.PutUint16(b[connectSegmentLocalPort:], uint16(c.localListenAddr.Port))
-	copy(b[connectSegmentRemoteIP:], c.remoteInternetAddr.IP.To16())
-	binary.BigEndian.PutUint16(b[connectSegmentRemotePort:], uint16(c.remoteInternetAddr.Port))
-	if c.localEnableFEC {
-		b[connectSegmentFEC] = 1
-	} else {
-		b[connectSegmentFEC] = 0
-	}
-	if c.localEnableCrypto {
-		b[connectSegmentCrypto] = 1
-		// copy(b[connectSegmentExchangeKey:], c.exchangeKey[:])
-	} else {
-		b[connectSegmentCrypto] = 0
-	}
-}
-
-// // return: connectSegmentType
-// func (c *Conn) decConnectSegment(b []byte, size int) byte {
-// 	c.remoteListenAddr.IP = append(c.remoteListenAddr.IP, b[msgDialLocalIP:msgDialLocalPort]...)
-// 	c.remoteListenAddr.Port = int(binary.BigEndian.Uint16(b[msgDialLocalPort:]))
-// 	c.localInternetAddr.IP = append(c.localInternetAddr.IP, b[msgDialRemoteIP:msgDialRemotePort]...)
-// 	c.localInternetAddr.Port = int(binary.BigEndian.Uint16(b[msgDialRemotePort:]))
-// 	c.readMSS = binary.BigEndian.Uint16(b[msgDialMSS:])
-// 	c.readQueueCap = calcQueueCap(size, int(c.readMSS))
-// 	c.readMaxSN = uint16(c.readQueueCap)
-// 	return b[connectSegmentType]
+// func (c *Conn) decHandshakeSegment(b []byte) byte {
+// 	c.listenAddr[1].IP = append(c.listenAddr[1].IP, b[handshakeSegmentLocalIP:handshakeSegmentLocalPort]...)
+// 	c.listenAddr[1].Port = int(binary.BigEndian.Uint16(b[handshakeSegmentLocalPort:]))
+// 	c.internetAddr[0].IP = append(c.internetAddr[0].IP, b[handshakeSegmentRemoteIP:handshakeSegmentRemotePort]...)
+// 	c.internetAddr[0].Port = int(binary.BigEndian.Uint16(b[handshakeSegmentRemotePort:]))
+// c.fec[1] = b[handshakeSegmentFEC]
+// c.crypto[1] = b[handshakeSegmentCrypto]
+// copy(c.exchangeKey[1][:], b[handshakeSegmentExchangeKey:handshakeSegmentLength])
+// return b[cmdSegmentType]
 // }
 
-// sn: 收到的新的数据sn
 func (c *Conn) encAckSegment(b []byte, sn uint16) {
-	b[0] = ackSegment | c.segmentType
-	binary.BigEndian.PutUint32(b[ackSegmentToken:], c.sToken)
+	b[segmentType] = ackSegment[c.from]
+	binary.BigEndian.PutUint32(b[ackSegmentToken:], c.token)
 	binary.BigEndian.PutUint16(b[ackSegmentDataSN:], sn)
-	binary.BigEndian.PutUint16(b[ackSegmentDataMaxSN:], c.readNextSN-1)
-	binary.BigEndian.PutUint16(b[ackSegmentDataFree:], uint16(c.readQueueCap-c.readQueueLen))
-	binary.BigEndian.PutUint32(b[ackSegmentSN:], c.localAckSN)
-	c.localAckSN++
+	binary.BigEndian.PutUint16(b[ackSegmentDataMaxSN:], c.sn[0])
+	binary.BigEndian.PutUint16(b[ackSegmentDataFree:], uint16(c.dataCap[0]-c.dataLen[0]))
+	binary.BigEndian.PutUint32(b[ackSegmentSN:], c.ackSN[0])
+	c.ackSN[0]++
 }

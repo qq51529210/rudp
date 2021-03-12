@@ -1,14 +1,27 @@
 package rudp
 
-import "net"
+import (
+	"net"
+	"sync"
+)
 
-// 第一字节
+// segment类型
 const (
-	serverSegment = 0b10000000 // server
-	clientSegment = 0b00000000 // client
-	cmdSegment    = 0b01000000 // 命令
-	dataSegment   = 0b00100000 // 数据
-	ackSegment    = 0b01100000 // 数据
+	dialSegment = iota
+	acceptSegment
+	handshakeSuccessSegment
+	pingSegment
+	pongSegment
+	clientDataSegment
+	serverDataSegment
+	clientAckSegment
+	serverAckSegment
+	clientDiscardSegment
+	serverDiscardSegment
+	clientDiscardAckCmdSegment
+	serverDiscardAckCmdSegment
+	invalidSegment
+	serverInvalidSegment
 )
 
 const (
@@ -23,58 +36,63 @@ const (
 )
 
 const (
-	cmdSegmentTypeDial = iota
-	cmdSegmentTypeAccept
-	cmdSegmentTypeReject
-	cmdSegmentTypeClose
-	cmdSegmentTypeInvalid
+	segmentType = 0
+)
+
+// dialSegment & acceptSegment
+const (
+	handshakeSegmentVersion     = segmentType + 1                  // 协议版本，protolVersion
+	handshakeSegmentToken       = handshakeSegmentVersion + 1      // 连接的随机token
+	handshakeSegmentTimestamp   = handshakeSegmentToken + 4        // 发起连接的时间戳
+	handshakeSegmentLocalIP     = handshakeSegmentTimestamp + 8    // local listen ip
+	handshakeSegmentLocalPort   = handshakeSegmentLocalIP + 16     // local listen port
+	handshakeSegmentRemoteIP    = handshakeSegmentLocalPort + 2    // remote internet ip
+	handshakeSegmentRemotePort  = handshakeSegmentRemoteIP + 16    // remote internet port
+	handshakeSegmentMSS         = handshakeSegmentRemotePort + 2   // 探测的mss，用于对方调整接收队列
+	handshakeSegmentTimeout     = handshakeSegmentMSS + 2          // client dial timeout，由于server会一直发送accept segment
+	handshakeSegmentFEC         = handshakeSegmentTimeout + 8      // 是否在后面的数据传输中启用纠错
+	handshakeSegmentCrypto      = handshakeSegmentFEC + 1          // 是否在后面的数据传输中启用加密
+	handshakeSegmentExchangeKey = handshakeSegmentCrypto + 1       // 如果启用加密，Diffie-Hellman交换密钥的随机数
+	handshakeSegmentLength      = handshakeSegmentExchangeKey + 32 // 长度
 )
 
 const (
-	segmentHeader  = 0
-	cmdSegmentType = 1
+	handshakeSuccessSegmentToken  = segmentType + 1
+	handshakeSuccessSegmentLength = handshakeSuccessSegmentToken + 4
 )
 
 const (
-	connectSegmentVersion     = cmdSegmentType + 1 // 协议版本，protolVersion
-	connectSegmentClientToken = connectSegmentVersion + 1
-	connectSegmentServerToken = connectSegmentClientToken + 4
-	connectSegmentLocalIP     = connectSegmentServerToken + 4
-	connectSegmentLocalPort   = connectSegmentLocalIP + 16
-	connectSegmentRemoteIP    = connectSegmentLocalPort + 2
-	connectSegmentRemotePort  = connectSegmentRemoteIP + 16
-	connectSegmentMSS         = connectSegmentRemotePort + 2
-	connectSegmentFEC         = connectSegmentMSS + 2
-	connectSegmentCrypto      = connectSegmentFEC + 1
-	connectSegmentExchangeKey = connectSegmentCrypto + 1
-	connectSegmentLength      = connectSegmentExchangeKey + 32
-)
-
-const (
-	rejectSegmentVersion     = cmdSegmentType + 1
-	rejectSegmentClientToken = rejectSegmentVersion + 1
-	rejectSegmentLength      = rejectSegmentClientToken + 4
-)
-
-const (
-	invalidSegmentToken  = cmdSegmentType + 1
-	invalidSegmentLength = invalidSegmentToken + 4
-)
-
-const (
-	dataSegmentToken   = 1
+	dataSegmentToken   = segmentType + 1
 	dataSegmentSN      = dataSegmentToken + 4
-	dataSegmentLevel   = dataSegmentSN + 2
-	dataSegmentPayload = dataSegmentLevel + 1
+	dataSegmentPayload = dataSegmentSN + 2
 )
 
 const (
-	ackSegmentToken     = 1
-	ackSegmentDataSN    = dataSegmentToken + 4
+	ackSegmentToken     = segmentType + 1
+	ackSegmentDataSN    = ackSegmentToken + 4
 	ackSegmentDataMaxSN = ackSegmentDataSN + 2
 	ackSegmentDataFree  = ackSegmentDataMaxSN + 2
 	ackSegmentSN        = ackSegmentDataFree + 2
 	ackSegmentLength    = ackSegmentSN + 4
+)
+
+const (
+	discardSegmentToken  = segmentType + 1
+	discardSegmentSN     = discardSegmentToken + 4
+	discardSegmentBegin  = discardSegmentToken + 2
+	discardSegmentEnd    = discardSegmentBegin + 2
+	discardSegmentLength = discardSegmentEnd + 2
+)
+
+const (
+	discardAckSegmentToken  = segmentType + 1
+	discardAckSegmentSN     = discardAckSegmentToken + 4
+	discardAckSegmentLength = discardAckSegmentSN + 2
+)
+
+const (
+	invalidSegmentToken  = segmentType + 1
+	invalidSegmentLength = invalidSegmentToken + 4
 )
 
 // 一个udp数据包
@@ -82,4 +100,18 @@ type segment struct {
 	b [maxMTU]byte
 	n int
 	a *net.UDPAddr
+}
+
+var (
+	segmentPool          sync.Pool
+	dataSegment          = []byte{clientDataSegment, serverDataSegment}
+	ackSegment           = []byte{clientAckSegment, serverAckSegment}
+	discardSegment       = []byte{clientDiscardSegment, serverDiscardSegment}
+	discardAckCmdSegment = []byte{clientDiscardAckCmdSegment, serverDiscardAckCmdSegment}
+)
+
+func init() {
+	segmentPool.New = func() interface{} {
+		return new(segment)
+	}
 }

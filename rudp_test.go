@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func Test_RUDP_IO(t *testing.T) {
+func Test_RUDP(t *testing.T) {
 	wait := sync.WaitGroup{}
 	wait.Add(2)
 	// server
