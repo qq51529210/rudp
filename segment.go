@@ -9,19 +9,24 @@ import (
 const (
 	dialSegment = iota
 	acceptSegment
-	handshakeSuccessSegment
+	connectedSegment
 	pingSegment
 	pongSegment
-	clientDataSegment
-	serverDataSegment
-	clientAckSegment
-	serverAckSegment
-	clientDiscardSegment
-	serverDiscardSegment
-	clientDiscardAckCmdSegment
-	serverDiscardAckCmdSegment
 	invalidSegment
-	serverInvalidSegment
+	dataSegment
+	dataAckSegment
+	discardSegment
+	discardAckSegment
+	// clientDataSegment
+	// serverDataSegment
+	// clientAckSegment
+	// serverAckSegment
+	// clientDiscardSegment
+	// serverDiscardSegment
+	// clientDiscardAckCmdSegment
+	// serverDiscardAckCmdSegment
+	// invalidSegment
+	// serverInvalidSegment
 )
 
 const (
@@ -36,63 +41,64 @@ const (
 )
 
 const (
-	segmentType = 0
-)
-
-// dialSegment & acceptSegment
-const (
-	handshakeSegmentVersion     = segmentType + 1                  // 协议版本，protolVersion
-	handshakeSegmentToken       = handshakeSegmentVersion + 1      // 连接的随机token
-	handshakeSegmentTimestamp   = handshakeSegmentToken + 4        // 发起连接的时间戳
-	handshakeSegmentLocalIP     = handshakeSegmentTimestamp + 8    // local listen ip
-	handshakeSegmentLocalPort   = handshakeSegmentLocalIP + 16     // local listen port
-	handshakeSegmentRemoteIP    = handshakeSegmentLocalPort + 2    // remote internet ip
-	handshakeSegmentRemotePort  = handshakeSegmentRemoteIP + 16    // remote internet port
-	handshakeSegmentMSS         = handshakeSegmentRemotePort + 2   // 探测的mss，用于对方调整接收队列
-	handshakeSegmentTimeout     = handshakeSegmentMSS + 2          // client dial timeout，由于server会一直发送accept segment
-	handshakeSegmentFEC         = handshakeSegmentTimeout + 8      // 是否在后面的数据传输中启用纠错
-	handshakeSegmentCrypto      = handshakeSegmentFEC + 1          // 是否在后面的数据传输中启用加密
-	handshakeSegmentExchangeKey = handshakeSegmentCrypto + 1       // 如果启用加密，Diffie-Hellman交换密钥的随机数
-	handshakeSegmentLength      = handshakeSegmentExchangeKey + 32 // 长度
+	segmentType  = 0               // segment类型
+	segmentToken = segmentType + 1 // 发起连接的随机token
 )
 
 const (
-	handshakeSuccessSegmentToken  = segmentType + 1
-	handshakeSuccessSegmentLength = handshakeSuccessSegmentToken + 4
+	connectSegmentToken      = connectSegmentVersion + 1    // 发起连接的随机token
+	connectSegmentVersion    = segmentType + 1              // 协议版本，protolVersion
+	connectSegmentTimestamp  = connectSegmentToken + 4      // 发起连接的时间戳
+	connectSegmentLocalIP    = connectSegmentTimestamp + 8  // local listen ip
+	connectSegmentLocalPort  = connectSegmentLocalIP + 16   // local listen port
+	connectSegmentRemoteIP   = connectSegmentLocalPort + 2  // remote internet ip
+	connectSegmentRemotePort = connectSegmentRemoteIP + 16  // remote internet port
+	connectSegmentMSS        = connectSegmentRemotePort + 2 // 探测的mss，用于对方调整接收队列
+	connectSegmentTimeout    = connectSegmentMSS + 2        // client dial timeout，server发送acceptSegment超时判断
+	connectSegmentLength     = connectSegmentTimeout + 8    // 长度
 )
 
 const (
-	dataSegmentToken   = segmentType + 1
-	dataSegmentSN      = dataSegmentToken + 4
+	connectedSegmentLength = segmentToken + 4
+)
+
+const (
+	pingSegmentSN     = segmentToken + 4
+	pingSegmentLength = pingSegmentSN + 4
+)
+
+const (
+	pongSegmentSN     = segmentToken + 4
+	pongSegmentLength = pongSegmentSN + 4
+)
+
+const (
+	dataSegmentSN      = segmentToken + 4
 	dataSegmentPayload = dataSegmentSN + 2
 )
 
 const (
-	ackSegmentToken     = segmentType + 1
-	ackSegmentDataSN    = ackSegmentToken + 4
-	ackSegmentDataMaxSN = ackSegmentDataSN + 2
-	ackSegmentDataFree  = ackSegmentDataMaxSN + 2
-	ackSegmentSN        = ackSegmentDataFree + 2
-	ackSegmentLength    = ackSegmentSN + 4
+	dataAckSegmentDataSN    = segmentToken + 4            // 数据包的sn
+	dataAckSegmentDataMaxSN = dataAckSegmentDataSN + 2    // 已收到数据包的最大sn
+	dataAckSegmentFree      = dataAckSegmentDataMaxSN + 2 // 接收队列的空闲
+	dataAckSegmentSN        = dataAckSegmentFree + 2
+	dataAckSegmentLength    = dataAckSegmentSN + 4
 )
 
 const (
-	discardSegmentToken  = segmentType + 1
-	discardSegmentSN     = discardSegmentToken + 4
-	discardSegmentBegin  = discardSegmentToken + 2
+	discardSegmentSN     = segmentToken + 4
+	discardSegmentBegin  = discardSegmentSN + 2
 	discardSegmentEnd    = discardSegmentBegin + 2
 	discardSegmentLength = discardSegmentEnd + 2
 )
 
 const (
-	discardAckSegmentToken  = segmentType + 1
-	discardAckSegmentSN     = discardAckSegmentToken + 4
+	discardAckSegmentSN     = segmentToken + 4
 	discardAckSegmentLength = discardAckSegmentSN + 2
 )
 
 const (
-	invalidSegmentToken  = segmentType + 1
-	invalidSegmentLength = invalidSegmentToken + 4
+	invalidSegmentLength = segmentToken + 4
 )
 
 // 一个udp数据包
@@ -103,11 +109,43 @@ type segment struct {
 }
 
 var (
-	segmentPool          sync.Pool
-	dataSegment          = []byte{clientDataSegment, serverDataSegment}
-	ackSegment           = []byte{clientAckSegment, serverAckSegment}
-	discardSegment       = []byte{clientDiscardSegment, serverDiscardSegment}
-	discardAckCmdSegment = []byte{clientDiscardAckCmdSegment, serverDiscardAckCmdSegment}
+	segmentPool sync.Pool
+	// dataSegment          = []byte{clientDataSegment, serverDataSegment}
+	// ackSegment           = []byte{clientAckSegment, serverAckSegment}
+	// discardSegment       = []byte{clientDiscardSegment, serverDiscardSegment}
+	// discardAckCmdSegment = []byte{clientDiscardAckCmdSegment, serverDiscardAckCmdSegment}
+	checkSegment = []func(seg *segment) bool{
+		func(seg *segment) bool {
+			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
+		}, // dialSegment
+		func(seg *segment) bool {
+			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
+		}, // acceptSegment
+		func(seg *segment) bool {
+			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectedSegmentLength
+		}, // connectedSegment
+		func(seg *segment) bool {
+			return seg.n == pingSegmentLength
+		}, // pingSegment
+		func(seg *segment) bool {
+			return seg.n == pongSegmentLength
+		}, // pongSegment
+		func(seg *segment) bool {
+			return seg.n == invalidSegmentLength
+		}, // invalidSegment
+		func(seg *segment) bool {
+			return seg.n >= dataSegmentPayload
+		}, // dataSegment
+		func(seg *segment) bool {
+			return seg.n == dataAckSegmentLength
+		}, // dataAckSegment
+		func(seg *segment) bool {
+			return seg.n == discardSegmentLength
+		}, // discardSegment
+		func(seg *segment) bool {
+			return seg.n == discardAckSegmentLength
+		}, // discardAckSegment
+	}
 )
 
 func init() {
