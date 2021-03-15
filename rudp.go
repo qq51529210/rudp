@@ -387,7 +387,7 @@ func (r *RUDP) handleUDPDataRoutine() {
 	}
 }
 
-func (r *RUDP) writeHandshakeSuccessSegment(seg *segment, token uint32) {
+func (r *RUDP) writeConnectedSegment(seg *segment, token uint32) {
 	seg.b[segmentType] = connectedSegment
 	binary.BigEndian.PutUint32(seg.b[segmentToken:], token)
 	r.WriteTo(seg.b[:connectedSegmentLength], seg.a)
@@ -402,7 +402,7 @@ func (r *RUDP) writeInvalidSegment(seg *segment, segType byte, token uint32) {
 func (r *RUDP) encConnectSegment(conn *Conn, buff []byte, segType byte, timeout time.Duration) {
 	buff[segmentType] = segType
 	buff[connectSegmentVersion] = protolVersion
-	binary.BigEndian.PutUint32(buff[connectSegmentToken:], conn.token)
+	binary.BigEndian.PutUint32(buff[segmentToken:], conn.token)
 	binary.BigEndian.PutUint64(buff[connectSegmentTimestamp:], conn.timestamp)
 	copy(buff[connectSegmentLocalIP:], conn.listenAddr[0].IP.To16())
 	binary.BigEndian.PutUint16(buff[connectSegmentLocalPort:], uint16(conn.listenAddr[0].Port))
@@ -461,7 +461,6 @@ func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from, state byte, token u
 	conn.quitSignal = make(chan struct{})
 	conn.connectSignal = make(chan struct{})
 	conn.handleQueue = make(chan *segment, r.connHandleQueue)
-	conn.diffieHellman = newDiffieHellman()
 	conn.listenAddr[0] = r.conn.LocalAddr().(*net.UDPAddr)
 	conn.listenAddr[1] = new(net.UDPAddr)
 	conn.internetAddr[0] = new(net.UDPAddr)
@@ -470,8 +469,8 @@ func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from, state byte, token u
 	conn.ioEnable[1] = make(chan byte, 1)
 	conn.dataCap[0] = r.connReadQueueCap
 	conn.dataCap[1] = r.connWriteQueueCap
-	conn.rto.min = minRTO
-	conn.rto.max = maxRTO
+	conn.minRTO = minRTO
+	conn.maxRTO = maxRTO
 	conn.mss[0] = mss
 }
 
@@ -522,14 +521,6 @@ func (r *RUDP) serverConnRoutine(conn *Conn, seg *segment, token uint32) {
 	copy(conn.internetAddr[0].IP, seg.b[connectSegmentLocalIP:])
 	conn.internetAddr[0].Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentRemotePort:]))
 	conn.mss[1] = binary.BigEndian.Uint16(seg.b[connectSegmentMSS:])
-	if seg.b[connectSegmentFEC] != 0 && r.fec != 0 {
-		conn.fec = new(fec)
-	}
-	if seg.b[connectSegmentCrypto] != 0 && r.crypto != 0 {
-		var key [32]byte
-		conn.diffieHellman.CryptoKey(seg.b[connectSegmentExchangeKey:connectSegmentLength], key[:])
-		conn.crypto = newCrypto(key[:])
-	}
 	// 计时器
 	timer := time.NewTimer(r.connectRTO)
 	defer timer.Stop()
@@ -614,12 +605,12 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				conn.lock.Unlock()
 				// 发送信号
 				close(conn.connectSignal)
-				// 响应
-				r.writeHandshakeSuccessSegment(seg, conn.token)
+				// 响应connectedSegment
+				r.writeConnectedSegment(seg, conn.token)
 			case connectState:
 				conn.lock.Unlock()
 				// 已经连接，响应connectedSegment
-				r.writeHandshakeSuccessSegment(seg, conn.token)
+				r.writeConnectedSegment(seg, conn.token)
 			default:
 				conn.lock.Unlock()
 				// 状态不对，响应invalidSegment
@@ -653,9 +644,26 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 			}
 			conn.dataLock[1].Unlock()
 		case dataSegment:
+			sn := binary.BigEndian.Uint16(seg.b[dataSegmentSN:])
+			data := seg.b[dataSegmentPayload:seg.n]
+			// 尝试添加
+			var ok bool
+			conn.dataLock[0].Lock()
+			ok = conn.addReadData(sn, data)
+			conn.dataLock[0].Unlock()
+			if ok {
+				// 响应dataAckSegment
+				seg.b[segmentType] = dataSegment | conn.from
+				binary.BigEndian.PutUint32(seg.b[segmentToken:], conn.token)
+				binary.BigEndian.PutUint16(seg.b[dataAckSegmentDataSN:], sn)
+				binary.BigEndian.PutUint16(seg.b[dataAckSegmentDataMaxSN:], conn.sn[0])
+				binary.BigEndian.PutUint16(seg.b[dataAckSegmentFree:], conn.dataCap[0]-conn.dataLen[0])
+				r.WriteToConn(seg.b[:dataAckSegmentLength], conn)
+			}
 		case dataAckSegment:
 			sn := binary.BigEndian.Uint16(seg.b[dataAckSegmentDataSN:])
 			maxSN := binary.BigEndian.Uint16(seg.b[dataAckSegmentDataMaxSN:])
+			// 移除
 			ok := false
 			conn.dataLock[1].Lock()
 			if maxSN > sn {
@@ -663,15 +671,33 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 			} else {
 				ok = conn.removeWriteData(sn)
 			}
+			conn.dataLock[1].Unlock()
+			// 更新
 			if ok {
 				id := binary.BigEndian.Uint32(seg.b[dataAckSegmentSN:])
 				if id > conn.ackSN[1] {
 					conn.writeDataMax = binary.BigEndian.Uint16(seg.b[dataAckSegmentFree:])
 				}
 			}
-			conn.dataLock[1].Unlock()
 		case discardSegment:
+			sn := binary.BigEndian.Uint16(seg.b[discardSegmentSN:])
+			begin := binary.BigEndian.Uint16(seg.b[discardSegmentBegin:])
+			end := binary.BigEndian.Uint16(seg.b[discardSegmentEnd:])
+			// 移除
+			conn.discardReadData(sn, begin, end)
+			// 响应discardAckSegment
+			seg.b[segmentType] = discardAckSegment | conn.from
+			binary.BigEndian.PutUint32(seg.b[segmentToken:], conn.token)
+			binary.BigEndian.PutUint16(seg.b[discardAckSegmentSN:], sn)
+			r.WriteToConn(seg.b[:discardAckSegmentLength], conn)
 		case discardAckSegment:
+			sn := binary.BigEndian.Uint16(seg.b[discardAckSegmentSN:])
+			// 更新write discard sn
+			conn.dataLock[1].Lock()
+			if conn.discardSN[1] == sn {
+				conn.discardSN[1]++
+			}
+			conn.dataLock[1].Unlock()
 		}
 		segmentPool.Put(seg)
 	}

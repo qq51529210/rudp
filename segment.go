@@ -46,9 +46,8 @@ const (
 )
 
 const (
-	connectSegmentToken      = connectSegmentVersion + 1    // 发起连接的随机token
-	connectSegmentVersion    = segmentType + 1              // 协议版本，protolVersion
-	connectSegmentTimestamp  = connectSegmentToken + 4      // 发起连接的时间戳
+	connectSegmentVersion    = segmentToken + 4             // 协议版本，protolVersion
+	connectSegmentTimestamp  = connectSegmentVersion + 1    // 发起连接的时间戳
 	connectSegmentLocalIP    = connectSegmentTimestamp + 8  // local listen ip
 	connectSegmentLocalPort  = connectSegmentLocalIP + 16   // local listen port
 	connectSegmentRemoteIP   = connectSegmentLocalPort + 2  // remote internet ip
