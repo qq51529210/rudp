@@ -13,16 +13,12 @@ import (
 )
 
 var (
-	readQueueCap    = uint16(0xffff / 2)                          // 默认的读缓存队列最大长度
-	writeQueueCap   = uint16(0xffff / 2)                          // 默认的写缓冲队列最大长度
-	handleQueueLen  = uint16(1024)                                // 默认的conn的处理队列长度
-	connectRTO      = 100 * time.Millisecond                      // connect segment超时重传，毫秒
+	connectRTO      = 300 * time.Millisecond                      // connectSegment超时重传，毫秒
+	maxConnection   = 1024 * 1024                                 // 最大的连接数
 	mathRand        = rand.New(rand.NewSource(time.Now().Unix())) // 随机数
 	DetectMSS       = detectMSS                                   // 返回mss和rtt
 	connClosedError = errors.New("conn has been closed")          // conn被关闭
 	rudpClosedError = errors.New("rudp has been closed")          // rudp被关闭
-	minRTO          = 10 * time.Millisecond                       // 最小超时重传，毫秒
-	maxRTO          = 100 * time.Millisecond                      // 最大超时重传，毫秒
 )
 
 // 连接池的键，因为客户端可能在nat后面，所以加上token
@@ -47,24 +43,9 @@ func (this *connKey) Init(a *net.UDPAddr) {
 	this.port = uint16(a.Port)
 }
 
-// 探测链路的mss，返回最适合的mss，以免被分包
+// 探测链路的mss，返回最适合的mss，以免被分包。返回0表示出错
 func detectMSS(*net.UDPAddr) (uint16, error) {
 	return maxMSS, nil
-}
-
-// 设置默认的conn的读缓存队列最大长度
-func SetReadQueueMaxLength(n uint16) {
-	readQueueCap = n
-}
-
-// 设置默认的conn的写缓冲队列最大长度
-func SetWriteQueueMaxLength(n uint16) {
-	writeQueueCap = n
-}
-
-// 设置默认的conn的segment处理队列长度
-func SetHandleQueueLength(n uint16) {
-	handleQueueLen = n
 }
 
 // 使用配置值创建一个新的RUDP，server能力需要配置Config.AcceptQueue
@@ -82,13 +63,12 @@ func Listen(address string) (*RUDP, error) {
 	// 初始化成员变量
 	r := new(RUDP)
 	r.conn = conn
-	r.quitSignal = make(chan struct{})
+	r.closeSignal = make(chan struct{})
 	r.connectRTO = connectRTO
-	r.connHandleQueue = handleQueueLen
-	r.connReadQueueCap = readQueueCap
-	r.connWriteQueueCap = writeQueueCap
+	r.connHandleQueue = connHandleQueueLen
+	r.maxConnection = maxConnection
 	// 使用的是server lock
-	r.acceptCond.L = &r.lock[1]
+	r.acceptCond.L = new(sync.Mutex)
 	for i := 0; i < len(r.connection); i++ {
 		r.connection[i] = make(map[connKey]*Conn)
 	}
@@ -102,35 +82,22 @@ func Listen(address string) (*RUDP, error) {
 
 // RUDP是一个同时具备C/S能力的引擎
 type RUDP struct {
-	conn              *net.UDPConn         // 底层socket
-	waitGroup         sync.WaitGroup       // 等待所有协程退出
-	quitSignal        chan struct{}        // 通知所有协程退出的信号
-	closed            bool                 // 是否调用了Close()
-	ioBytes           [2]uint64            // io总字节，0:read，1:write
-	lock              [2]sync.RWMutex      // 相关数据的锁，0:client，1:server
-	connection        [2]map[connKey]*Conn // 所有的Conn，0:client，1:server
-	acceptConn        list.List            // 已经建立连接的Conn，等待Accept()调用
-	acceptCond        sync.Cond            // 等待client连接的信号
-	fec               byte                 // 新连接纠错
-	crypto            byte                 // 新的连接加密的算法
-	connectRTO        time.Duration        // 建立连接，connect segment的超时重发
-	connHandleQueue   uint16               // 新连接的segment处理队列大小
-	connReadQueueCap  uint16               // 新连接的接收队列大小
-	connWriteQueueCap uint16               // 新连接的发送队列大小
-}
-
-// 设置新的连接是否启用纠错
-func (r *RUDP) EnableFEC(fec byte) {
-	r.fec = fec
-}
-
-// 设置新的连接是否启用加密
-func (r *RUDP) EnableCrypto(crypto byte) {
-	r.crypto = crypto
+	conn            *net.UDPConn         // 底层socket
+	waitGroup       sync.WaitGroup       // 等待所有协程退出
+	closeSignal     chan struct{}        // 通知所有协程退出的信号
+	closed          bool                 // 是否调用了Close()
+	connectRTO      time.Duration        // 建立连接，connect segment的超时重发
+	connHandleQueue uint16               // 新连接的segment处理队列大小
+	ioBytes         [2]uint64            // io总字节，0:read，1:write
+	lock            [2]sync.RWMutex      // 相关数据的锁，0:client，1:server
+	connection      [2]map[connKey]*Conn // 所有的Conn，0:client，1:server
+	acceptConn      list.List            // 已经建立连接的Conn，等待Accept()调用
+	acceptCond      sync.Cond            // 等待client连接的信号
+	maxConnection   int                  // 最大的连接数量
 }
 
 // 建立连接，发送connect segment的超时重传，最小1ms
-func (r *RUDP) SetconnectRTO(timeout time.Duration) {
+func (r *RUDP) SetConnectRTO(timeout time.Duration) {
 	if timeout < time.Millisecond {
 		r.connectRTO = time.Millisecond
 	} else {
@@ -138,14 +105,13 @@ func (r *RUDP) SetconnectRTO(timeout time.Duration) {
 	}
 }
 
-// 新的连接的读队列最大长度
-func (r *RUDP) SetConnReadQueueCap(n uint16) {
-	r.connReadQueueCap = n
-}
-
-// 新的连接的写队列最大长度
-func (r *RUDP) SetConnWriteQueueCap(n uint16) {
-	r.connWriteQueueCap = n
+// 最大的连接数
+func (r *RUDP) SetMaxConnection(n int) {
+	if n < 1 {
+		r.maxConnection = maxConnection
+	} else {
+		r.maxConnection = n
+	}
 }
 
 // net.Listener接口
@@ -162,12 +128,12 @@ func (r *RUDP) Close() error {
 	}
 	r.closed = true
 	// 通知所有协程退出
-	close(r.quitSignal)
+	close(r.closeSignal)
 	r.acceptCond.Broadcast()
 	// 关闭所有的Conn
 	for i := 0; i < len(r.connection); i++ {
 		for _, v := range r.connection[i] {
-			v.Close()
+			r.removeConn(v)
 		}
 	}
 	// 等待所有协程退出
@@ -177,19 +143,19 @@ func (r *RUDP) Close() error {
 
 // net.Listener接口
 func (r *RUDP) Accept() (net.Conn, error) {
-	r.acceptCond.L.Lock()
-	for !r.closed {
+	for {
+		r.acceptCond.L.Lock()
+		if r.closed {
+			r.acceptCond.L.Unlock()
+			break
+		}
 		if r.acceptConn.Len() < 1 {
 			r.acceptCond.Wait()
-			continue
 		}
 		v := r.acceptConn.Remove(r.acceptConn.Front())
-		conn := v.(*Conn)
-		conn.state = connectState
 		r.acceptCond.L.Unlock()
 		return v.(*Conn), nil
 	}
-	r.acceptCond.L.Unlock()
 	return nil, r.netOpError("accept", rudpClosedError)
 }
 
@@ -201,42 +167,39 @@ func (r *RUDP) Dial(address string, timeout time.Duration) (*Conn, error) {
 		return nil, err
 	}
 	// 新的client Conn
-	conn, err := r.newDialConn(addr)
+	conn, err := r.newClientConn(addr)
 	if err != nil {
 		return nil, err
 	}
-	// timeout timer
-	ticker := time.NewTicker(r.connectRTO)
-	defer ticker.Stop()
-	// 初始化dial connect segment
+	// 初始化dialSegment
 	var buff [maxMSS]byte
 	r.encConnectSegment(conn, buff[:], dialSegment, timeout)
-	for err == nil {
+	for {
 		select {
 		case <-time.After(timeout): // 连接超时
 			err = new(timeoutError)
-		case <-ticker.C: // 超时重传
+		case <-conn.timer.C: // 超时重传
 			r.WriteToConn(buff[:connectSegmentLength], conn)
-		case <-conn.connectSignal: // 连接信号
-			switch conn.state {
+			conn.timer.Reset(r.connectRTO)
+		case state := <-conn.stateSignal: // 连接信号
+			switch state {
 			case connectState: // 已连接，返回
-				r.waitGroup.Add(2)
-				go r.clientConnRoutine(conn)
-				go r.connHandleSegmentRoutine(conn)
+				r.waitGroup.Add(1)
+				go r.connRtoRoutine(conn)
 				return conn, nil
 			case dialState: // 拒绝连接，返回
 				err = errors.New("connect reject")
 			default:
 				err = connClosedError
 			}
-		case <-conn.quitSignal: // Conn关闭信号
-			err = connClosedError
-		case <-r.quitSignal: // RUDP关闭信号
+		case <-r.closeSignal: // RUDP关闭信号
 			err = rudpClosedError
 		}
+		if err != nil {
+			r.removeConn(conn)
+			return nil, conn.netOpError("dial", err)
+		}
 	}
-	r.removeConn(conn)
-	return nil, conn.netOpError("dial", err)
 }
 
 // 使用net.UDPConn向指定地址发送指定数据
@@ -303,7 +266,9 @@ func (r *RUDP) handleUDPDataRoutine() {
 		}
 		r.ioBytes[0] += uint64(seg.n)
 		// 处理
-		if !checkSegment[seg.b[0]](seg) {
+		from = seg.b[0] >> 7
+		seg.b[0] = seg.b[0] & 0b01111111
+		if seg.b[0] > invalidSegment || !checkSegment[seg.b[0]](seg) {
 			segmentPool.Put(seg)
 			continue
 		}
@@ -312,8 +277,19 @@ func (r *RUDP) handleUDPDataRoutine() {
 		switch seg.b[0] {
 		case dialSegment:
 			timestamp := binary.BigEndian.Uint64(seg.b[connectSegmentTimestamp:])
-			// 获取Conn
+			// 最大连接数
 			r.lock[1].Lock()
+			if len(r.connection[1]) >= r.maxConnection {
+				r.lock[1].Unlock()
+				// 响应rejectSegment
+				seg.b[0] = rejectSegment | serverSegment
+				seg.b[rejectSegmentVersion] = protolVersion
+				binary.BigEndian.PutUint64(seg.b[rejectSegmentTimestamp:], timestamp)
+				r.WriteTo(seg.b[:rejectSegmentLength], seg.a)
+				segmentPool.Put(seg)
+				continue
+			}
+			// 获取Conn
 			conn, ok = r.connection[1][*key]
 			if !ok {
 				// 不存在，注册到connection
@@ -321,59 +297,57 @@ func (r *RUDP) handleUDPDataRoutine() {
 				conn.timestamp = timestamp
 				r.connection[1][*key] = conn
 				r.lock[1].Unlock()
-				// 启动routine
+				r.initConn(conn, seg.a, serverSegment, key.token)
 				r.waitGroup.Add(1)
-				go r.serverConnRoutine(conn, seg, key.token)
+				go r.connHandleSegmentRoutine(conn)
 			} else {
+				// 有相应的Conn，但是timestamp比较新，说明是新的dialSegment
 				if timestamp > conn.timestamp {
-					// 有相应的Conn，但是timestamp比较新，说明是新的dialSegment
-					r.waitGroup.Add(1)
-					// 在routine中关闭
-					go func(c *Conn) {
-						defer r.waitGroup.Done()
-						r.removeConn(c)
-					}(conn)
-					// 新的Conn
+					// 原来的
+					old := conn
+					// 新的
 					conn = new(Conn)
 					conn.timestamp = timestamp
 					r.connection[1][*key] = conn
 					r.lock[1].Unlock()
+					r.initConn(conn, seg.a, serverSegment, key.token)
 					// 启动routine
 					r.waitGroup.Add(1)
-					go r.serverConnRoutine(conn, seg, key.token)
-				} else {
-					r.lock[1].Unlock()
-					segmentPool.Put(seg)
+					go r.connHandleSegmentRoutine(conn)
+					// 在routine中关闭
+					r.waitGroup.Add(1)
+					go func(c *Conn) {
+						defer r.waitGroup.Done()
+						r.removeConn(c)
+					}(old)
 				}
 			}
+			// 添加到Conn处理队列
+			select {
+			case conn.handleQueue <- seg:
+			default:
+				segmentPool.Put(seg)
+			}
 		case invalidSegment:
-			from = seg.b[0] >> 7
 			r.lock[from].RLock()
 			conn, ok = r.connection[from][*key]
 			r.lock[from].RUnlock()
-			if !ok {
-				segmentPool.Put(seg)
-			} else {
+			if ok {
 				// 在routine中关闭
+				r.waitGroup.Add(1)
 				go func(c *Conn) {
 					defer r.waitGroup.Done()
 					r.removeConn(c)
 				}(conn)
 			}
+			segmentPool.Put(seg)
 		default:
-			from = seg.b[0] >> 7
-			if from == 1 {
-				r.lock[0].RLock()
-				conn, ok = r.connection[0][*key]
-				r.lock[0].RUnlock()
-			} else {
-				r.lock[1].RLock()
-				conn, ok = r.connection[1][*key]
-				r.lock[1].RUnlock()
-			}
+			r.lock[from].RLock()
+			conn, ok = r.connection[from][*key]
+			r.lock[from].RUnlock()
 			if !ok {
-				// 不存在，响应invalidSegment
-				r.writeInvalidSegment(seg, invalidSegment, key.token)
+				// 不存在响应invalidSegment
+				r.writeInvalidSegment(seg, (^from)<<7, key.token)
 				segmentPool.Put(seg)
 			} else {
 				// 添加到Conn处理队列
@@ -387,20 +361,14 @@ func (r *RUDP) handleUDPDataRoutine() {
 	}
 }
 
-func (r *RUDP) writeConnectedSegment(seg *segment, token uint32) {
-	seg.b[segmentType] = connectedSegment
-	binary.BigEndian.PutUint32(seg.b[segmentToken:], token)
-	r.WriteTo(seg.b[:connectedSegmentLength], seg.a)
-}
-
-func (r *RUDP) writeInvalidSegment(seg *segment, segType byte, token uint32) {
-	seg.b[segmentType] = segType
+func (r *RUDP) writeInvalidSegment(seg *segment, from byte, token uint32) {
+	seg.b[segmentType] = invalidSegment | from
 	binary.BigEndian.PutUint32(seg.b[segmentToken:], token)
 	r.WriteTo(seg.b[:invalidSegmentLength], seg.a)
 }
 
 func (r *RUDP) encConnectSegment(conn *Conn, buff []byte, segType byte, timeout time.Duration) {
-	buff[segmentType] = segType
+	buff[segmentType] = segType | conn.from
 	buff[connectSegmentVersion] = protolVersion
 	binary.BigEndian.PutUint32(buff[segmentToken:], conn.token)
 	binary.BigEndian.PutUint64(buff[connectSegmentTimestamp:], conn.timestamp)
@@ -408,11 +376,30 @@ func (r *RUDP) encConnectSegment(conn *Conn, buff []byte, segType byte, timeout 
 	binary.BigEndian.PutUint16(buff[connectSegmentLocalPort:], uint16(conn.listenAddr[0].Port))
 	copy(buff[connectSegmentRemoteIP:], conn.internetAddr[1].IP.To16())
 	binary.BigEndian.PutUint16(buff[connectSegmentRemotePort:], uint16(conn.internetAddr[1].Port))
-	binary.BigEndian.PutUint16(buff[connectSegmentMSS:], conn.mss[0])
+	binary.BigEndian.PutUint16(buff[connectSegmentMSS:], conn.dataMSS[0])
+	binary.BigEndian.PutUint16(buff[connectSegmentReadQueue:], conn.dataCap[0])
 	binary.BigEndian.PutUint64(buff[connectSegmentTimeout:], uint64(timeout))
 }
 
-func (r *RUDP) newDialConn(addr *net.UDPAddr) (*Conn, error) {
+func (r *RUDP) decConnectSegment(conn *Conn, seg *segment) {
+	copy(conn.listenAddr[1].IP, seg.b[connectSegmentLocalIP:])
+	conn.listenAddr[1].Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentLocalPort:]))
+	copy(conn.internetAddr[0].IP, seg.b[connectSegmentRemoteIP:])
+	conn.internetAddr[0].Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentRemotePort:]))
+	conn.dataMSS[1] = binary.BigEndian.Uint16(seg.b[connectSegmentMSS:])
+	conn.remoteReadQueue = binary.BigEndian.Uint16(seg.b[connectSegmentReadQueue:])
+}
+
+func (r *RUDP) writeAckSegment(conn *Conn, seg *segment, sn uint16) {
+	seg.b[segmentType] = dataSegment | conn.from
+	binary.BigEndian.PutUint32(seg.b[segmentToken:], conn.token)
+	binary.BigEndian.PutUint16(seg.b[ackSegmentDataSN:], sn)
+	binary.BigEndian.PutUint16(seg.b[ackSegmentDataMaxSN:], conn.dataSN[0])
+	binary.BigEndian.PutUint16(seg.b[ackSegmentReadQueueFree:], conn.dataCap[0]-conn.dataLen[0])
+	r.WriteToConn(seg.b[:ackSegmentLength], conn)
+}
+
+func (r *RUDP) newClientConn(addr *net.UDPAddr) (*Conn, error) {
 	// 探测mss
 	mss, err := detectMSS(addr)
 	if err != nil {
@@ -448,30 +435,33 @@ func (r *RUDP) newDialConn(addr *net.UDPAddr) (*Conn, error) {
 		}
 	}
 	// 初始化Conn
-	r.initConn(conn, addr, 0, dialState, key.token, mss)
+	r.initConn(conn, addr, clientSegment, key.token)
 	conn.timestamp = uint64(time.Now().Unix())
+	conn.dataMSS[0] = mss
+	conn.timer = time.NewTimer(0)
+	// conn处理segment
+	r.waitGroup.Add(1)
+	go r.connHandleSegmentRoutine(conn)
 	return conn, nil
 }
 
-func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from, state byte, token uint32, mss uint16) {
+func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from byte, token uint32) {
 	conn.rudp = r
 	conn.from = from
 	conn.token = token
-	conn.state = state
-	conn.quitSignal = make(chan struct{})
-	conn.connectSignal = make(chan struct{})
+	conn.state = dialState
+	conn.stateSignal = make(chan byte, 1)
 	conn.handleQueue = make(chan *segment, r.connHandleQueue)
 	conn.listenAddr[0] = r.conn.LocalAddr().(*net.UDPAddr)
 	conn.listenAddr[1] = new(net.UDPAddr)
 	conn.internetAddr[0] = new(net.UDPAddr)
 	conn.internetAddr[1] = addr
-	conn.ioEnable[0] = make(chan byte, 1)
-	conn.ioEnable[1] = make(chan byte, 1)
-	conn.dataCap[0] = r.connReadQueueCap
-	conn.dataCap[1] = r.connWriteQueueCap
-	conn.minRTO = minRTO
-	conn.maxRTO = maxRTO
-	conn.mss[0] = mss
+	conn.dataEnable[0] = make(chan byte, 1)
+	conn.dataEnable[1] = make(chan byte, 1)
+	conn.dataCap[0] = connReadQueueMaxLength
+	conn.dataCap[1] = connWriteQueueMaxLength
+	conn.minRTO = connMinRTO
+	conn.maxRTO = connMaxRTO
 }
 
 func (r *RUDP) removeConn(conn *Conn) {
@@ -484,91 +474,25 @@ func (r *RUDP) removeConn(conn *Conn) {
 	conn.state = closedState
 	conn.lock.Unlock()
 	// 释放资源
-	close(conn.quitSignal)
-	close(conn.ioEnable[0])
-	close(conn.ioEnable[1])
+	close(conn.stateSignal)
+	close(conn.dataEnable[0])
+	close(conn.dataEnable[1])
 	conn.releaseReadData()
 	conn.releaseWriteData()
 	for seg := range conn.handleQueue {
 		segmentPool.Put(seg)
 	}
 	// 移除
+	from := conn.from >> 7
 	var key connKey
 	key.Init(conn.internetAddr[1])
 	key.token = conn.token
-	r.lock[conn.from].Lock()
-	delete(r.connection[conn.from], key)
-	r.lock[conn.from].Unlock()
+	r.lock[from].Lock()
+	delete(r.connection[from], key)
+	r.lock[from].Unlock()
 }
 
-func (r *RUDP) serverConnRoutine(conn *Conn, seg *segment, token uint32) {
-	defer func() {
-		segmentPool.Put(seg)
-		r.removeConn(conn)
-		r.waitGroup.Done()
-	}()
-	// 探测mss
-	mss, err := detectMSS(seg.a)
-	if err != nil {
-		// todo log
-		return
-	}
-	// 初始化Conn
-	r.initConn(conn, seg.a, 1, dialState, token, mss)
-	// 读取dialSegment字段
-	copy(conn.listenAddr[1].IP, seg.b[connectSegmentLocalIP:])
-	conn.listenAddr[1].Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentLocalPort:]))
-	copy(conn.internetAddr[0].IP, seg.b[connectSegmentLocalIP:])
-	conn.internetAddr[0].Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentRemotePort:]))
-	conn.mss[1] = binary.BigEndian.Uint16(seg.b[connectSegmentMSS:])
-	// 计时器
-	timer := time.NewTimer(r.connectRTO)
-	defer timer.Stop()
-	// 先发送accept
-	timeout := time.Duration(binary.BigEndian.Uint64(seg.b[connectSegmentTimeout:]))
-	var buff [maxMSS]byte
-	r.encConnectSegment(conn, buff[:], acceptSegment, timeout)
-Loop:
-	for {
-		select {
-		case <-time.After(timeout): // 连接超时
-			return
-		case <-timer.C: // 超时重传
-			r.WriteToConn(buff[:connectSegmentLength], conn)
-			timer.Reset(r.connectRTO)
-		case <-r.quitSignal: // RUDP关闭信号
-			return
-		case <-conn.quitSignal: // Conn关闭信号
-			return
-		case <-conn.connectSignal: // 建立连接信号
-			switch conn.state {
-			case connectState: // 已连接，返回
-				break Loop
-			}
-			return
-		}
-	}
-	// 加入acceptConn
-	r.acceptCond.L.Lock()
-	r.acceptConn.PushBack(conn)
-	r.acceptCond.L.Unlock()
-	r.acceptCond.Broadcast()
-	// 重置计时器
-	timer.Reset(conn.rto)
-	for {
-		select {
-		case <-r.quitSignal: // RUDP关闭信号
-			return
-		case <-conn.quitSignal: // Conn关闭信号
-			return
-		case now := <-timer.C: // 超时重传检查
-			conn.retransmission(&now)
-			timer.Reset(conn.rto)
-		}
-	}
-}
-
-func (r *RUDP) clientConnRoutine(conn *Conn) {
+func (r *RUDP) connRtoRoutine(conn *Conn) {
 	timer := time.NewTimer(conn.rto)
 	defer func() {
 		timer.Stop()
@@ -577,128 +501,159 @@ func (r *RUDP) clientConnRoutine(conn *Conn) {
 	}()
 	for {
 		select {
-		case <-r.quitSignal: // RUDP关闭信号
+		case <-r.closeSignal: // RUDP关闭信号
 			return
-		case <-conn.quitSignal: // Conn关闭信号
+		case <-conn.stateSignal: // Conn关闭信号
 			return
 		case now := <-timer.C: // 超时重传检查
-			conn.retransmission(&now)
+			conn.checkRTO(&now)
 			timer.Reset(conn.rto)
 		}
 	}
 }
 
 func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
-	defer r.waitGroup.Done()
-	for {
-		seg, ok := <-conn.handleQueue
-		if !ok {
+	defer func() {
+		r.waitGroup.Done()
+		r.removeConn(conn)
+	}()
+	for !r.closed {
+		select {
+		case <-r.closeSignal:
 			return
-		}
-		switch seg.b[0] {
-		case acceptSegment:
-			conn.lock.Lock()
-			switch conn.state {
-			case dialState:
-				// 状态
-				conn.state = connectState
-				conn.lock.Unlock()
-				// 发送信号
-				close(conn.connectSignal)
-				// 响应connectedSegment
-				r.writeConnectedSegment(seg, conn.token)
-			case connectState:
-				conn.lock.Unlock()
-				// 已经连接，响应connectedSegment
-				r.writeConnectedSegment(seg, conn.token)
-			default:
-				conn.lock.Unlock()
-				// 状态不对，响应invalidSegment
-				r.writeInvalidSegment(seg, invalidSegment, conn.token)
+		case <-conn.stateSignal:
+			return
+		case seg, ok := <-conn.handleQueue:
+			if !ok {
+				return
 			}
-		case connectedSegment:
-			conn.lock.Lock()
-			switch conn.state {
-			case dialState:
-				// 修改状态
-				conn.state = connectState
-				conn.lock.Unlock()
-				// 发送连接信号
-				close(conn.connectSignal)
-			case connectedSegment:
-				conn.lock.Unlock()
-			default:
-				conn.lock.Unlock()
-				// 状态不对，响应invalidSegment
-				r.writeInvalidSegment(seg, invalidSegment, conn.token)
-			}
-		case pingSegment:
-			seg.b[segmentType] = pongSegment
-			r.WriteToConn(seg.b[:pongSegmentLength], conn)
-		case pongSegment:
-			sn := binary.BigEndian.Uint32(seg.b[pongSegmentSN:])
-			conn.dataLock[1].Lock()
-			if sn == conn.pingSN {
-				conn.pingSN++
-				conn.readTime = time.Now()
-			}
-			conn.dataLock[1].Unlock()
-		case dataSegment:
-			sn := binary.BigEndian.Uint16(seg.b[dataSegmentSN:])
-			data := seg.b[dataSegmentPayload:seg.n]
-			// 尝试添加
-			var ok bool
-			conn.dataLock[0].Lock()
-			ok = conn.addReadData(sn, data)
-			conn.dataLock[0].Unlock()
-			if ok {
-				// 响应dataAckSegment
-				seg.b[segmentType] = dataSegment | conn.from
-				binary.BigEndian.PutUint32(seg.b[segmentToken:], conn.token)
-				binary.BigEndian.PutUint16(seg.b[dataAckSegmentDataSN:], sn)
-				binary.BigEndian.PutUint16(seg.b[dataAckSegmentDataMaxSN:], conn.sn[0])
-				binary.BigEndian.PutUint16(seg.b[dataAckSegmentFree:], conn.dataCap[0]-conn.dataLen[0])
-				r.WriteToConn(seg.b[:dataAckSegmentLength], conn)
-			}
-		case dataAckSegment:
-			sn := binary.BigEndian.Uint16(seg.b[dataAckSegmentDataSN:])
-			maxSN := binary.BigEndian.Uint16(seg.b[dataAckSegmentDataMaxSN:])
-			// 移除
-			ok := false
-			conn.dataLock[1].Lock()
-			if maxSN > sn {
-				ok = conn.removeWriteDataBefore(maxSN)
-			} else {
-				ok = conn.removeWriteData(sn)
-			}
-			conn.dataLock[1].Unlock()
-			// 更新
-			if ok {
-				id := binary.BigEndian.Uint32(seg.b[dataAckSegmentSN:])
-				if id > conn.ackSN[1] {
-					conn.writeDataMax = binary.BigEndian.Uint16(seg.b[dataAckSegmentFree:])
+			switch seg.b[0] {
+			case dialSegment:
+				conn.lock.Lock()
+				switch conn.state {
+				case dialState:
+					conn.state = connectState
+					conn.lock.Unlock()
+					// 探测mss
+					mss, err := detectMSS(seg.a)
+					if err != nil {
+						return
+					}
+					conn.dataMSS[0] = mss
+					// 加入acceptConn
+					r.acceptCond.L.Lock()
+					r.acceptConn.PushBack(conn)
+					r.acceptCond.L.Unlock()
+					r.acceptCond.Broadcast()
+					// rto routine
+					r.waitGroup.Add(1)
+					go r.connRtoRoutine(conn)
+					// 响应acceptSegment
+					r.encConnectSegment(conn, seg.b[:], acceptSegment, time.Duration(conn.timestamp))
+					r.WriteToConn(seg.b[:connectSegmentLength], conn)
+				case connectState:
+					conn.lock.Unlock()
+					// 响应acceptSegment
+					r.encConnectSegment(conn, seg.b[:], acceptSegment, time.Duration(conn.timestamp))
+					r.WriteToConn(seg.b[:connectSegmentLength], conn)
+				default:
+					conn.lock.Unlock()
+				}
+			case acceptSegment:
+				if conn.from == clientSegment {
+					conn.lock.Lock()
+					switch conn.state {
+					case dialState:
+						// 状态
+						conn.state = connectState
+						conn.lock.Unlock()
+						// 解析acceptSegment字段
+						r.decConnectSegment(conn, seg)
+						// 发送信号
+						conn.stateSignal <- connectState
+					case closedState:
+						conn.lock.Unlock()
+						// 已经关闭，响应invalidSegment
+						r.writeInvalidSegment(seg, conn.from, conn.token)
+					default:
+						conn.lock.Unlock()
+					}
+				}
+			case rejectSegment:
+				if conn.from == clientSegment {
+					timestamp := binary.BigEndian.Uint64(seg.b[rejectSegmentTimestamp:])
+					if conn.timestamp == timestamp {
+						conn.lock.Lock()
+						switch conn.state {
+						case dialState:
+							conn.lock.Unlock()
+							// 发送信号
+							conn.stateSignal <- dialState
+						default:
+							conn.lock.Unlock()
+						}
+					}
+				}
+			case pingSegment:
+				if conn.from == serverSegment {
+					if conn.state == connectState {
+						seg.b[segmentType] = pongSegment
+						r.WriteToConn(seg.b[:pongSegmentLength], conn)
+					}
+				}
+			case pongSegment:
+				if conn.from == clientSegment {
+					if conn.state == connectState {
+						sn := binary.BigEndian.Uint32(seg.b[pongSegmentSN:])
+						conn.dataLock[1].Lock()
+						if sn == conn.pingSN {
+							conn.pingSN++
+							conn.readTime = time.Now()
+						}
+						conn.dataLock[1].Unlock()
+					}
+				}
+			case dataSegment:
+				if conn.state == connectState {
+					sn := binary.BigEndian.Uint16(seg.b[dataSegmentSN:])
+					data := seg.b[dataSegmentPayload:seg.n]
+					// 尝试添加
+					conn.dataLock[0].Lock()
+					conn.addReadData(sn, data)
+					conn.dataLock[0].Unlock()
+					// 响应ackSegment
+					r.writeAckSegment(conn, seg, sn)
+				}
+			case ackSegment:
+				if conn.state == connectState {
+					sn := binary.BigEndian.Uint16(seg.b[ackSegmentDataSN:])
+					maxSN := binary.BigEndian.Uint16(seg.b[ackSegmentDataMaxSN:])
+					// 移除
+					conn.dataLock[1].Lock()
+					if maxSN > sn {
+						conn.removeWriteDataBefore(maxSN)
+					} else {
+						conn.removeWriteData(sn)
+					}
+					conn.dataLock[1].Unlock()
+					// 更新
+					ackSN := binary.BigEndian.Uint32(seg.b[ackSegmentSN:])
+					if ackSN > conn.ackSN[1] {
+						conn.remoteReadQueue = binary.BigEndian.Uint16(seg.b[ackSegmentReadQueueFree:])
+					}
+				}
+			case discardSegment:
+				if conn.state == connectState {
+					sn := binary.BigEndian.Uint16(seg.b[discardSegmentSN:])
+					// 移除
+					conn.dataLock[0].Lock()
+					conn.discardReadData(sn)
+					conn.dataLock[0].Unlock()
+					// 响应ackSegment
+					r.writeAckSegment(conn, seg, sn)
 				}
 			}
-		case discardSegment:
-			sn := binary.BigEndian.Uint16(seg.b[discardSegmentSN:])
-			begin := binary.BigEndian.Uint16(seg.b[discardSegmentBegin:])
-			end := binary.BigEndian.Uint16(seg.b[discardSegmentEnd:])
-			// 移除
-			conn.discardReadData(sn, begin, end)
-			// 响应discardAckSegment
-			seg.b[segmentType] = discardAckSegment | conn.from
-			binary.BigEndian.PutUint32(seg.b[segmentToken:], conn.token)
-			binary.BigEndian.PutUint16(seg.b[discardAckSegmentSN:], sn)
-			r.WriteToConn(seg.b[:discardAckSegmentLength], conn)
-		case discardAckSegment:
-			sn := binary.BigEndian.Uint16(seg.b[discardAckSegmentSN:])
-			// 更新write discard sn
-			conn.dataLock[1].Lock()
-			if conn.discardSN[1] == sn {
-				conn.discardSN[1]++
-			}
-			conn.dataLock[1].Unlock()
+			segmentPool.Put(seg)
 		}
-		segmentPool.Put(seg)
 	}
 }

@@ -12,82 +12,70 @@ import (
 func Test_RUDP(t *testing.T) {
 	wait := sync.WaitGroup{}
 	wait.Add(2)
+	clientHash := md5.New()
+	serverHash := md5.New()
+	var serverError, clientError error
+	var serverAddress = "127.0.0.1:20000"
+	var clientAddress = "127.0.0.1:30000"
 	// server
-	server, err := Listen("127.0.0.1:10000")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// client
-	client, err := Listen("127.0.0.1:10000")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 哈希，用于校验传输的数据
-	wh := md5.New()
-	rh := md5.New()
-	// server协程
 	go func() {
 		defer wait.Done()
-		// 监听新的Conn
-		conn, err := server.Accept()
+		server, err := Listen(serverAddress)
 		if err != nil {
-			t.Log(err)
+			serverError = err
 			return
 		}
-		//t.Log("conn from", conn.RemoteAddr())
-		var buf [maxMSS]byte
-		for {
-			// 读取数据
-			n, err := conn.Read(buf[:])
+		// client
+		go func() {
+			defer wait.Done()
+			client, err := Listen(clientAddress)
 			if err != nil {
-				// 判断对方是否关闭连接
-				if err != io.EOF {
-					t.Log(err)
-					return
-				} else {
-					// 对方关闭，退出循环
-					break
-				}
-			}
-			// 写入哈希
-			rh.Write(buf[:n])
-		}
-		conn.Close()
-	}()
-	// client协程
-	go func() {
-		defer wait.Done()
-		// 拨号连接
-		conn, err := client.Dial("127.0.0.1:10000", time.Second*10)
-		if err != nil {
-			t.Log(err)
-			return
-		}
-		//t.Log("conn from", conn.RemoteAddr())
-		buf := make([]byte, 1024)
-		n := 10240
-		// 1024*10240，10m的数据
-		for i := 0; i < n; i++ {
-			// 随机数据
-			mathRand.Read(buf)
-			// 写入哈希
-			wh.Write(buf)
-			// 发送
-			_, err = conn.Write(buf)
-			if err != nil {
-				t.Log(err)
+				clientError = err
 				return
 			}
+			client.SetConnectRTO(time.Second * 3)
+			conn, err := client.Dial(serverAddress, time.Hour)
+			if err != nil {
+				clientError = err
+				return
+			}
+			buff := make([]byte, 1024)
+			for i := 0; i < 1; i++ {
+				mathRand.Read(buff)
+				n, err := conn.Write(buff)
+				if err != nil {
+					clientError = err
+					return
+				}
+				clientHash.Write(buff[:n])
+			}
+		}()
+		buff := make([]byte, 1024)
+		for {
+			conn, err := server.Accept()
+			if err != nil {
+				serverError = err
+				return
+			}
+			n, err := conn.Read(buff)
+			if err != nil {
+				if err != io.EOF {
+					serverError = err
+				}
+				return
+			}
+			serverHash.Write(buff[:n])
 		}
-		// 关闭连接
-		conn.Close()
 	}()
-	// 等待完成
 	wait.Wait()
-	server.Close()
-	client.Close()
+	if serverError != nil {
+		t.Fatal(serverError)
+	}
+	if clientError != nil {
+		t.Fatal(clientError)
+	}
 	// 比较传输的数据哈希值
-	if !bytes.Equal(wh.Sum(nil), rh.Sum(nil)) {
+	if !bytes.Equal(clientHash.Sum(nil), serverHash.Sum(nil)) {
 		t.FailNow()
 	}
 }

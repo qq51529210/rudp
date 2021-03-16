@@ -1,32 +1,27 @@
 package rudp
 
 import (
+	"fmt"
 	"net"
 	"sync"
+)
+
+const (
+	clientSegment = 1 << 7
+	serverSegment = 0
 )
 
 // segment类型
 const (
 	dialSegment = iota
 	acceptSegment
-	connectedSegment
+	rejectSegment
 	pingSegment
 	pongSegment
-	invalidSegment
 	dataSegment
-	dataAckSegment
 	discardSegment
-	discardAckSegment
-	// clientDataSegment
-	// serverDataSegment
-	// clientAckSegment
-	// serverAckSegment
-	// clientDiscardSegment
-	// serverDiscardSegment
-	// clientDiscardAckCmdSegment
-	// serverDiscardAckCmdSegment
-	// invalidSegment
-	// serverInvalidSegment
+	ackSegment
+	invalidSegment
 )
 
 const (
@@ -53,97 +48,89 @@ const (
 	connectSegmentRemoteIP   = connectSegmentLocalPort + 2  // remote internet ip
 	connectSegmentRemotePort = connectSegmentRemoteIP + 16  // remote internet port
 	connectSegmentMSS        = connectSegmentRemotePort + 2 // 探测的mss，用于对方调整接收队列
-	connectSegmentTimeout    = connectSegmentMSS + 2        // client dial timeout，server发送acceptSegment超时判断
+	connectSegmentReadQueue  = connectSegmentMSS + 2        // 接收队列的空闲个数
+	connectSegmentTimeout    = connectSegmentReadQueue + 2  // client dial timeout，server发送acceptSegment超时判断
 	connectSegmentLength     = connectSegmentTimeout + 8    // 长度
 )
 
 const (
-	connectedSegmentLength = segmentToken + 4
+	rejectSegmentVersion   = segmentToken + 4           // 协议版本，protolVersion
+	rejectSegmentTimestamp = rejectSegmentVersion + 1   // 发起连接的时间戳
+	rejectSegmentLength    = rejectSegmentTimestamp + 8 // 长度
 )
 
 const (
-	pingSegmentSN     = segmentToken + 4
-	pingSegmentLength = pingSegmentSN + 4
+	pingSegmentSN     = segmentToken + 4  // ping sn
+	pingSegmentLength = pingSegmentSN + 4 // 长度
 )
 
 const (
-	pongSegmentSN     = segmentToken + 4
-	pongSegmentLength = pongSegmentSN + 4
+	pongSegmentSN     = segmentToken + 4  // ping的sn
+	pongSegmentLength = pongSegmentSN + 4 // 长度
 )
 
 const (
-	dataSegmentSN      = segmentToken + 4
-	dataSegmentPayload = dataSegmentSN + 2
+	dataSegmentSN      = segmentToken + 4  // sn
+	dataSegmentPayload = dataSegmentSN + 2 // 数据起始
 )
 
 const (
-	dataAckSegmentDataSN    = segmentToken + 4            // 数据包的sn
-	dataAckSegmentDataMaxSN = dataAckSegmentDataSN + 2    // 已收到数据包的最大sn
-	dataAckSegmentFree      = dataAckSegmentDataMaxSN + 2 // 接收队列的空闲
-	dataAckSegmentSN        = dataAckSegmentFree + 2
-	dataAckSegmentLength    = dataAckSegmentSN + 4
+	ackSegmentDataSN        = segmentToken + 4            // 数据包的sn
+	ackSegmentDataMaxSN     = ackSegmentDataSN + 2        // 已收到数据包的最大sn
+	ackSegmentReadQueueFree = ackSegmentDataMaxSN + 2     // 接收队列的空闲
+	ackSegmentSN            = ackSegmentReadQueueFree + 2 // ack的递增sn，sn更新才能更新ackSegmentReadQueueFree
+	ackSegmentLength        = ackSegmentSN + 4            // 长度
 )
 
 const (
-	discardSegmentSN     = segmentToken + 4
-	discardSegmentBegin  = discardSegmentSN + 2
-	discardSegmentEnd    = discardSegmentBegin + 2
-	discardSegmentLength = discardSegmentEnd + 2
-)
-
-const (
-	discardAckSegmentSN     = segmentToken + 4
-	discardAckSegmentLength = discardAckSegmentSN + 2
+	discardSegmentSN     = segmentToken + 4     // 数据包的sn
+	discardSegmentBegin  = discardSegmentSN + 2 // 丢弃的起始sn
+	discardSegmentLength = discardSegmentSN + 2 // 长度
 )
 
 const (
 	invalidSegmentLength = segmentToken + 4
 )
 
-// 一个udp数据包
-type segment struct {
-	b [maxMTU]byte
-	n int
-	a *net.UDPAddr
-}
-
 var (
-	segmentPool sync.Pool
-	// dataSegment          = []byte{clientDataSegment, serverDataSegment}
-	// ackSegment           = []byte{clientAckSegment, serverAckSegment}
-	// discardSegment       = []byte{clientDiscardSegment, serverDiscardSegment}
-	// discardAckCmdSegment = []byte{clientDiscardAckCmdSegment, serverDiscardAckCmdSegment}
+	segmentPool  sync.Pool
 	checkSegment = []func(seg *segment) bool{
 		func(seg *segment) bool {
+			fmt.Println("dial segment", seg.a)
 			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
 		}, // dialSegment
 		func(seg *segment) bool {
+			fmt.Println("accept segment", seg.a)
 			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
 		}, // acceptSegment
 		func(seg *segment) bool {
-			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectedSegmentLength
-		}, // connectedSegment
+			fmt.Println("reject segment", seg.a)
+			return seg.b[rejectSegmentVersion] == protolVersion && seg.n == rejectSegmentLength
+		}, // rejectSegment
 		func(seg *segment) bool {
+			fmt.Println("ping segment", seg.a)
 			return seg.n == pingSegmentLength
 		}, // pingSegment
 		func(seg *segment) bool {
+			fmt.Println("pong segment", seg.a)
 			return seg.n == pongSegmentLength
 		}, // pongSegment
 		func(seg *segment) bool {
-			return seg.n == invalidSegmentLength
-		}, // invalidSegment
-		func(seg *segment) bool {
+			fmt.Println("data segment", seg.a)
 			return seg.n >= dataSegmentPayload
 		}, // dataSegment
 		func(seg *segment) bool {
-			return seg.n == dataAckSegmentLength
-		}, // dataAckSegment
-		func(seg *segment) bool {
+			fmt.Println("discard segment", seg.a)
 			return seg.n == discardSegmentLength
 		}, // discardSegment
 		func(seg *segment) bool {
-			return seg.n == discardAckSegmentLength
-		}, // discardAckSegment
+			fmt.Println("ack segment", seg.a)
+			return seg.n == ackSegmentLength
+		}, // ackSegment
+		func(seg *segment) bool {
+			fmt.Println("invalid segment from", seg.a)
+			return seg.n == invalidSegmentLength
+		}, // invalidSegment
 	}
 )
 
@@ -151,4 +138,11 @@ func init() {
 	segmentPool.New = func() interface{} {
 		return new(segment)
 	}
+}
+
+// 一个udp数据包
+type segment struct {
+	b [maxMTU]byte
+	n int
+	a *net.UDPAddr
 }
