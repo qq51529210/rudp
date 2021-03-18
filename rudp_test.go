@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -17,28 +18,33 @@ func Test_RUDP(t *testing.T) {
 	var serverError, clientError error
 	var serverAddress = "127.0.0.1:20000"
 	var clientAddress = "127.0.0.1:30000"
+	server, err := Listen(serverAddress)
+	if err != nil {
+		serverError = err
+		return
+	}
+	defer server.Close()
+	client, err := Listen(clientAddress)
+	if err != nil {
+		clientError = err
+		return
+	}
+	defer client.Close()
 	// server
 	go func() {
 		defer wait.Done()
-		server, err := Listen(serverAddress)
-		if err != nil {
-			serverError = err
-			return
-		}
 		// client
 		go func() {
+			// 等server accept
+			time.Sleep(time.Millisecond * 10)
 			defer wait.Done()
-			client, err := Listen(clientAddress)
-			if err != nil {
-				clientError = err
-				return
-			}
 			client.SetConnectRTO(time.Second * 3)
 			conn, err := client.Dial(serverAddress, time.Hour)
 			if err != nil {
 				clientError = err
 				return
 			}
+			conn.SetMinRTO(time.Second)
 			buff := make([]byte, 1024)
 			for i := 0; i < 1; i++ {
 				mathRand.Read(buff)
@@ -49,6 +55,7 @@ func Test_RUDP(t *testing.T) {
 				}
 				clientHash.Write(buff[:n])
 			}
+			conn.Close()
 		}()
 		buff := make([]byte, 1024)
 		for {
@@ -57,14 +64,20 @@ func Test_RUDP(t *testing.T) {
 				serverError = err
 				return
 			}
-			n, err := conn.Read(buff)
-			if err != nil {
-				if err != io.EOF {
-					serverError = err
+			wait.Add(1)
+			go func(conn net.Conn) {
+				defer wait.Done()
+				for {
+					n, err := conn.Read(buff)
+					if err != nil {
+						if err != io.EOF {
+							serverError = err
+						}
+						return
+					}
+					serverHash.Write(buff[:n])
 				}
-				return
-			}
-			serverHash.Write(buff[:n])
+			}(conn)
 		}
 	}()
 	wait.Wait()

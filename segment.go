@@ -16,11 +16,9 @@ const (
 	dialSegment = iota
 	acceptSegment
 	rejectSegment
-	pingSegment
-	pongSegment
 	dataSegment
-	discardSegment
 	ackSegment
+	closeSegment
 	invalidSegment
 )
 
@@ -33,6 +31,7 @@ const (
 	maxMTU        = 1500                            // 链路最大的MTU
 	minMSS        = minMTU - ipV6Header - udpHeader // 应用层最小数据包
 	maxMSS        = maxMTU - ipV4Header - udpHeader // 应用层最大数据包
+	maxDataSN     = 0xffffff                        // dataSegement的最大sn，24位
 )
 
 const (
@@ -60,32 +59,22 @@ const (
 )
 
 const (
-	pingSegmentSN     = segmentToken + 4  // ping sn
-	pingSegmentLength = pingSegmentSN + 4 // 长度
-)
-
-const (
-	pongSegmentSN     = segmentToken + 4  // ping的sn
-	pongSegmentLength = pongSegmentSN + 4 // 长度
-)
-
-const (
 	dataSegmentSN      = segmentToken + 4  // sn
-	dataSegmentPayload = dataSegmentSN + 2 // 数据起始
+	dataSegmentPayload = dataSegmentSN + 3 // 数据起始
 )
 
 const (
 	ackSegmentDataSN        = segmentToken + 4            // 数据包的sn
-	ackSegmentDataMaxSN     = ackSegmentDataSN + 2        // 已收到数据包的最大sn
-	ackSegmentReadQueueFree = ackSegmentDataMaxSN + 2     // 接收队列的空闲
+	ackSegmentDataMaxSN     = ackSegmentDataSN + 3        // 已收到数据包的最大sn
+	ackSegmentReadQueueFree = ackSegmentDataMaxSN + 3     // 接收队列的空闲
 	ackSegmentSN            = ackSegmentReadQueueFree + 2 // ack的递增sn，sn更新才能更新ackSegmentReadQueueFree
 	ackSegmentLength        = ackSegmentSN + 4            // 长度
 )
 
 const (
-	discardSegmentSN     = segmentToken + 4     // 数据包的sn
-	discardSegmentBegin  = discardSegmentSN + 2 // 丢弃的起始sn
-	discardSegmentLength = discardSegmentSN + 2 // 长度
+	closeSegmentSN        = segmentToken + 4
+	closeSegmentTimestamp = closeSegmentSN + 3
+	closeSegmentLength    = closeSegmentTimestamp + 8
 )
 
 const (
@@ -96,37 +85,29 @@ var (
 	segmentPool  sync.Pool
 	checkSegment = []func(seg *segment) bool{
 		func(seg *segment) bool {
-			fmt.Println("dial segment", seg.a)
+			fmt.Println("dial segment from", seg.a)
 			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
 		}, // dialSegment
 		func(seg *segment) bool {
-			fmt.Println("accept segment", seg.a)
+			fmt.Println("accept segment from", seg.a)
 			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
 		}, // acceptSegment
 		func(seg *segment) bool {
-			fmt.Println("reject segment", seg.a)
+			fmt.Println("reject segment from", seg.a)
 			return seg.b[rejectSegmentVersion] == protolVersion && seg.n == rejectSegmentLength
 		}, // rejectSegment
 		func(seg *segment) bool {
-			fmt.Println("ping segment", seg.a)
-			return seg.n == pingSegmentLength
-		}, // pingSegment
-		func(seg *segment) bool {
-			fmt.Println("pong segment", seg.a)
-			return seg.n == pongSegmentLength
-		}, // pongSegment
-		func(seg *segment) bool {
-			fmt.Println("data segment", seg.a)
+			fmt.Println("data segment from", seg.a)
 			return seg.n >= dataSegmentPayload
 		}, // dataSegment
 		func(seg *segment) bool {
-			fmt.Println("discard segment", seg.a)
-			return seg.n == discardSegmentLength
-		}, // discardSegment
-		func(seg *segment) bool {
-			fmt.Println("ack segment", seg.a)
+			fmt.Println("ack segment from", seg.a)
 			return seg.n == ackSegmentLength
 		}, // ackSegment
+		func(seg *segment) bool {
+			fmt.Println("close segment from", seg.a)
+			return seg.n == closeSegmentLength
+		}, // closeSegment
 		func(seg *segment) bool {
 			fmt.Println("invalid segment from", seg.a)
 			return seg.n == invalidSegmentLength
@@ -145,4 +126,14 @@ type segment struct {
 	b [maxMTU]byte
 	n int
 	a *net.UDPAddr
+}
+
+func uint24(b []byte) uint32 {
+	return uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16
+}
+
+func putUint24(b []byte, v uint32) {
+	b[0] = byte(v >> 16)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v)
 }
