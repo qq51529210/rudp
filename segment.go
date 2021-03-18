@@ -129,7 +129,7 @@ type segment struct {
 }
 
 func uint24(b []byte) uint32 {
-	return uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16
+	return uint32(b[2]) | uint32(b[1])<<8 | uint32(b[0])<<16
 }
 
 func putUint24(b []byte, v uint32) {

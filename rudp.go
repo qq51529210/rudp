@@ -248,7 +248,6 @@ func (r *RUDP) netOpError(op string, err error) error {
 
 // 读取并处理udp数据包
 func (r *RUDP) handleUDPDataRoutine() {
-	r.waitGroup.Add(1)
 	defer r.waitGroup.Done()
 	var err error
 	var from byte
@@ -435,29 +434,30 @@ func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from byte, token uint32) 
 func (r *RUDP) removeConn(conn *Conn) {
 	// 修改状态
 	conn.lock.Lock()
-	if conn.state == closedState {
+	if conn.state&invalidState != 0 {
 		conn.lock.Unlock()
 		return
 	}
-	conn.state = closedState
+	conn.state |= invalidState
 	conn.lock.Unlock()
-	// 释放资源
-	close(conn.stateSignal)
-	close(conn.dataEnable[0])
-	close(conn.dataEnable[1])
-	conn.releaseReadData()
-	conn.releaseWriteData()
-	for seg := range conn.handleQueue {
-		segmentPool.Put(seg)
-	}
 	// 移除
-	from := conn.from >> 7
+	from := (^conn.from) >> 7
 	var key connKey
 	key.Init(conn.internetAddr[1])
 	key.token = conn.token
 	r.lock[from].Lock()
 	delete(r.connection[from], key)
 	r.lock[from].Unlock()
+	// 释放资源
+	close(conn.stateSignal)
+	close(conn.dataEnable[0])
+	close(conn.dataEnable[1])
+	conn.releaseReadData()
+	conn.releaseWriteData()
+	close(conn.handleQueue)
+	for seg := range conn.handleQueue {
+		segmentPool.Put(seg)
+	}
 }
 
 func (r *RUDP) connRtoRoutine(conn *Conn) {
@@ -484,8 +484,8 @@ func (r *RUDP) connRtoRoutine(conn *Conn) {
 
 func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 	defer func() {
-		r.waitGroup.Done()
 		r.removeConn(conn)
+		r.waitGroup.Done()
 	}()
 	for !r.closed {
 		select {
@@ -568,7 +568,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				}
 			case dataSegment:
 				if uint16(seg.n) <= conn.dataMSS[1] && conn.state == connectState {
-					sn := binary.BigEndian.Uint32(seg.b[dataSegmentSN:])
+					sn := uint24(seg.b[dataSegmentSN:])
 					data := seg.b[dataSegmentPayload:seg.n]
 					// 尝试添加
 					conn.dataLock[0].Lock()
@@ -587,9 +587,9 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					r.writeInvalidSegment(seg, conn.from, conn.token)
 				}
 			case ackSegment:
-				if conn.state != closedState {
-					sn := binary.BigEndian.Uint32(seg.b[ackSegmentDataSN:])
-					maxSN := binary.BigEndian.Uint32(seg.b[ackSegmentDataMaxSN:])
+				if conn.state != invalidSegment {
+					sn := uint24(seg.b[ackSegmentDataSN:])
+					maxSN := uint24(seg.b[ackSegmentDataMaxSN:])
 					// 移除
 					conn.dataLock[1].Lock()
 					if maxSN > sn {
@@ -611,6 +611,10 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					}
 				}
 			case closeSegment:
+				if conn.state&closedState == 0 {
+					conn.state |= closedState
+				}
+				r.writeInvalidSegment(seg, conn.from, conn.token)
 				segmentPool.Put(seg)
 				return
 			}

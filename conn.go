@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	dialState    = iota // 正在建立连接
-	connectState        // 已经确认连接
-	closingState        // 正在关闭连接，应用层调用Conn.Close()
-	closedState         // 关闭的连接
+	dialState    = 1 << iota // 正在建立连接
+	connectState             // 已经确认连接
+	closedState              // 对面关闭连接
+	invalidState             // 无效的连接
 )
 
 const (
@@ -118,22 +118,22 @@ func (c *Conn) Read(b []byte) (int, error) {
 			n = c.read(b)
 			c.dataLock[0].Unlock()
 			if n == 0 {
-				if c.state != closedState {
+				if c.state&closedState != 0 {
 					return 0, io.EOF
 				}
-				if c.state != closingState {
-					return 0, c.netOpError("read", connClosedError)
+				if c.state&connectState != 0 {
+					select {
+					case <-c.dataEnable[0]:
+						continue
+					case <-c.stateSignal:
+						if c.state&closedState != 0 {
+							return 0, io.EOF
+						}
+					}
 				}
-				select {
-				case <-c.dataEnable[0]:
-					continue
-				case <-c.stateSignal:
-					return 0, c.netOpError("read", connClosedError)
-				}
+				return 0, c.netOpError("read", connClosedError)
 			}
-			if n > 0 {
-				return n, nil
-			}
+			return n, nil
 		}
 	}
 	// 设置了超时
@@ -147,24 +147,24 @@ func (c *Conn) Read(b []byte) (int, error) {
 		n = c.read(b)
 		c.dataLock[0].Unlock()
 		if n == 0 {
-			if c.state != closedState {
+			if c.state&closedState != 0 {
 				return 0, io.EOF
 			}
-			if c.state != closingState {
-				return 0, c.netOpError("read", connClosedError)
+			if c.state&connectState != 0 {
+				select {
+				case <-time.After(duration):
+					return 0, c.netOpError("read", new(timeoutError))
+				case <-c.dataEnable[0]:
+					continue
+				case <-c.stateSignal:
+					if c.state&closedState != 0 {
+						return 0, io.EOF
+					}
+				}
 			}
-			select {
-			case <-c.dataEnable[0]:
-				continue
-			case <-c.stateSignal:
-				return 0, c.netOpError("read", connClosedError)
-			case <-time.After(duration):
-				return 0, c.netOpError("read", new(timeoutError))
-			}
+			return 0, c.netOpError("read", connClosedError)
 		}
-		if n > 0 {
-			return n, nil
-		}
+		return n, nil
 	}
 }
 
@@ -230,11 +230,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 func (c *Conn) Close() error {
 	// 修改状态
 	c.lock.Lock()
-	if c.state >= closingState {
+	if c.state != connectState {
 		c.lock.Unlock()
 		return c.netOpError("close", connClosedError)
 	}
-	c.state = closingState
+	c.state = closedState
 	c.lock.Unlock()
 	return nil
 }
@@ -480,6 +480,9 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 	p := c.readDataHead
 	for p != nil && p.sn == c.dataSN[0] {
 		c.dataSN[0]++
+		if c.dataSN[0] > maxDataSN {
+			c.dataSN[0] = 0
+		}
 		p = p.next
 	}
 	return true
@@ -498,7 +501,7 @@ func (c *Conn) newWriteData() *writeData {
 	d.first = time.Time{}
 	d.buff[segmentType] = c.from | dataSegment
 	binary.BigEndian.PutUint32(d.buff[segmentToken:], c.token)
-	binary.BigEndian.PutUint32(d.buff[dataSegmentSN:], d.sn)
+	putUint24(d.buff[dataSegmentSN:], d.sn)
 	d.len = dataSegmentPayload
 	c.dataLen[1]++
 	return d
@@ -662,12 +665,11 @@ func (c *Conn) checkRTO(now time.Time, rudp *RUDP) {
 	n := c.dataLen[1]
 	// 没有数据
 	if n < 1 {
-		switch c.state {
-		case closingState:
+		if c.state&closedState != 0 {
 			// 应用层关闭连接，发送closeSegment
 			c.buff[segmentType] = closeSegment | c.from
 			binary.BigEndian.PutUint32(c.buff[segmentToken:], c.token)
-			binary.BigEndian.PutUint32(c.buff[closeSegmentSN:], c.dataSN[1])
+			putUint24(c.buff[closeSegmentSN:], c.dataSN[1])
 			binary.BigEndian.PutUint64(c.buff[closeSegmentTimestamp:], c.timestamp)
 			rudp.WriteToConn(c.buff[:closeSegmentLength], c)
 		}
@@ -726,8 +728,8 @@ func (c *Conn) decConnectSegment(seg *segment) {
 func (c *Conn) writeAckSegment(rudp *RUDP, seg *segment, sn uint32) {
 	seg.b[segmentType] = ackSegment | c.from
 	binary.BigEndian.PutUint32(seg.b[segmentToken:], c.token)
-	binary.BigEndian.PutUint32(seg.b[ackSegmentDataSN:], sn)
-	binary.BigEndian.PutUint32(seg.b[ackSegmentDataMaxSN:], c.dataSN[0])
+	putUint24(seg.b[ackSegmentDataSN:], sn)
+	putUint24(seg.b[ackSegmentDataMaxSN:], c.dataSN[0]-1)
 	binary.BigEndian.PutUint16(seg.b[ackSegmentReadQueueFree:], c.dataCap[0]-c.dataLen[0])
 	binary.BigEndian.PutUint32(seg.b[ackSegmentSN:], c.ackSN[0])
 	c.ackSN[0]++
