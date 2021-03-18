@@ -572,7 +572,8 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					data := seg.b[dataSegmentPayload:seg.n]
 					// 尝试添加
 					conn.dataLock[0].Lock()
-					ok = conn.addReadData(sn, data)
+					conn.addReadData(sn, data)
+					ok = conn.readDataHead != nil && conn.readDataHead.sn < conn.dataSN[0]
 					conn.dataLock[0].Unlock()
 					// 响应ackSegment
 					conn.writeAckSegment(r, seg, sn)
@@ -587,7 +588,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					r.writeInvalidSegment(seg, conn.from, conn.token)
 				}
 			case ackSegment:
-				if conn.state != invalidSegment {
+				if conn.state&invalidState == 0 {
 					sn := uint24(seg.b[ackSegmentDataSN:])
 					maxSN := uint24(seg.b[ackSegmentDataMaxSN:])
 					// 移除

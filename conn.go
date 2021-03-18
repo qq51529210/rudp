@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	dialState    = 1 << iota // 正在建立连接
-	connectState             // 已经确认连接
-	closedState              // 对面关闭连接
-	invalidState             // 无效的连接
+	dialState     = 1 << iota // 正在建立连接
+	connectState              // 已经确认连接
+	shutdownState             // 主动关闭连接
+	closedState               // 被动关闭连接
+	invalidState              // 无效的连接
 )
 
 const (
@@ -26,7 +27,7 @@ var (
 	writeDataPool   sync.Pool                // writeData pool
 	connWriteQueue  = uint16(1024)           // 默认的conn的发送队列长度
 	connReadQueue   = uint16(1024)           // 默认的conn的接收队列长度
-	connHandleQueue = uint16(1024)           // 默认的conn的处理队列长度
+	connHandleQueue = uint16(16)             // 默认的conn的处理队列长度
 	connMinRTO      = 100 * time.Millisecond // 最小超时重传，毫秒
 	connMaxRTO      = 400 * time.Millisecond // 最大超时重传，毫秒
 )
@@ -118,19 +119,21 @@ func (c *Conn) Read(b []byte) (int, error) {
 			n = c.read(b)
 			c.dataLock[0].Unlock()
 			if n == 0 {
+				// 被关闭连接
 				if c.state&closedState != 0 {
 					return 0, io.EOF
 				}
-				if c.state&connectState != 0 {
+				// 连接状态
+				if c.state == connectState {
 					select {
 					case <-c.dataEnable[0]:
 						continue
 					case <-c.stateSignal:
-						if c.state&closedState != 0 {
-							return 0, io.EOF
-						}
+						// 继续读完缓存中的数据
+						continue
 					}
 				}
+				// 主动关闭，或无效
 				return 0, c.netOpError("read", connClosedError)
 			}
 			return n, nil
@@ -147,21 +150,23 @@ func (c *Conn) Read(b []byte) (int, error) {
 		n = c.read(b)
 		c.dataLock[0].Unlock()
 		if n == 0 {
+			// 被关闭连接
 			if c.state&closedState != 0 {
 				return 0, io.EOF
 			}
-			if c.state&connectState != 0 {
+			// 连接状态
+			if c.state == connectState {
 				select {
 				case <-time.After(duration):
 					return 0, c.netOpError("read", new(timeoutError))
 				case <-c.dataEnable[0]:
 					continue
 				case <-c.stateSignal:
-					if c.state&closedState != 0 {
-						return 0, io.EOF
-					}
+					// 继续读完缓存中的数据
+					continue
 				}
 			}
+			// 主动关闭，或无效
 			return 0, c.netOpError("read", connClosedError)
 		}
 		return n, nil
@@ -202,6 +207,8 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if duration <= 0 {
 		return 0, c.netOpError("write", new(timeoutError))
 	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
 	for {
 		if c.state != connectState {
 			return 0, c.netOpError("write", connClosedError)
@@ -211,12 +218,12 @@ func (c *Conn) Write(b []byte) (int, error) {
 		c.dataLock[1].Unlock()
 		if n == 0 {
 			select {
+			case <-timer.C:
+				return 0, c.netOpError("write", new(timeoutError))
 			case <-c.dataEnable[1]:
 				continue
 			case <-c.stateSignal:
 				return 0, c.netOpError("write", connClosedError)
-			case <-time.After(duration):
-				return 0, c.netOpError("write", new(timeoutError))
 			}
 		}
 		m += n
@@ -234,7 +241,7 @@ func (c *Conn) Close() error {
 		c.lock.Unlock()
 		return c.netOpError("close", connClosedError)
 	}
-	c.state = closedState
+	c.state |= shutdownState
 	c.lock.Unlock()
 	return nil
 }
@@ -384,11 +391,11 @@ func (c *Conn) read(b []byte) int {
 			break
 		}
 		// 拷贝数据到buf
-		m = copy(b[n:], c.readDataHead.data[c.readDataHead.idx:])
+		m = copy(b[n:], c.readDataHead.data[c.readDataHead.idx:c.readDataHead.len])
 		n += m
 		c.readDataHead.idx += uint16(m)
 		// 数据块数据拷贝完了，从队列中移除
-		if c.readDataHead.idx == uint16(len(c.readDataHead.data)) {
+		if c.readDataHead.idx >= c.readDataHead.len {
 			c.removeReadDataFront()
 		}
 		// buf满了
@@ -410,21 +417,21 @@ func (c *Conn) newReadData(sn uint32, data []byte, next *readData) *readData {
 }
 
 // 尝试添加一个数据块，成功返回true
-func (c *Conn) addReadData(sn uint32, data []byte) bool {
+func (c *Conn) addReadData(sn uint32, data []byte) {
 	// 是否在接收范围
 	maxSN := c.dataSN[0] + uint32(c.dataCap[0])
 	if maxSN > maxDataSN {
 		// 溢出的情况
 		maxSN -= maxDataSN
 		if sn < c.dataSN[0] && sn > maxSN {
-			return false
+			return
 		}
 		if c.readDataHead == nil {
 			c.readDataHead = c.newReadData(sn, data, nil)
 		} else {
 			p := c.readDataHead
 			if sn == p.sn {
-				return false
+				return
 			}
 			if sn < p.sn {
 				c.readDataHead = c.newReadData(sn, data, p)
@@ -433,7 +440,7 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 				p = p.next
 				for p != nil {
 					if sn == p.sn {
-						return false
+						return
 					}
 					if sn >= c.dataSN[0] && sn < p.sn {
 						break
@@ -448,14 +455,14 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 		}
 	} else {
 		if sn < c.dataSN[0] || sn > maxSN {
-			return false
+			return
 		}
 		if c.readDataHead == nil {
 			c.readDataHead = c.newReadData(sn, data, nil)
 		} else {
 			p := c.readDataHead
 			if sn == p.sn {
-				return false
+				return
 			}
 			if sn < p.sn {
 				c.readDataHead = c.newReadData(sn, data, p)
@@ -464,7 +471,7 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 				p = p.next
 				for p != nil {
 					if sn == p.sn {
-						return false
+						return
 					}
 					if sn < p.sn {
 						break
@@ -485,7 +492,6 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 		}
 		p = p.next
 	}
-	return true
 }
 
 // 新的添加到发送队列的writeData
@@ -665,7 +671,7 @@ func (c *Conn) checkRTO(now time.Time, rudp *RUDP) {
 	n := c.dataLen[1]
 	// 没有数据
 	if n < 1 {
-		if c.state&closedState != 0 {
+		if c.state&shutdownState != 0 {
 			// 应用层关闭连接，发送closeSegment
 			c.buff[segmentType] = closeSegment | c.from
 			binary.BigEndian.PutUint32(c.buff[segmentToken:], c.token)
