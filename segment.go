@@ -1,7 +1,6 @@
 package rudp
 
 import (
-	"fmt"
 	"net"
 	"sync"
 )
@@ -48,8 +47,7 @@ const (
 	connectSegmentRemotePort = connectSegmentRemoteIP + 16  // remote internet port
 	connectSegmentMSS        = connectSegmentRemotePort + 2 // 探测的mss，用于对方调整接收队列
 	connectSegmentReadQueue  = connectSegmentMSS + 2        // 接收队列的空闲个数
-	connectSegmentTimeout    = connectSegmentReadQueue + 2  // client dial timeout，server发送acceptSegment超时判断
-	connectSegmentLength     = connectSegmentTimeout + 8    // 长度
+	connectSegmentLength     = connectSegmentReadQueue + 2  // 长度
 )
 
 const (
@@ -67,8 +65,8 @@ const (
 	ackSegmentDataSN        = segmentToken + 4            // 数据包的sn
 	ackSegmentDataMaxSN     = ackSegmentDataSN + 3        // 已收到数据包的最大sn
 	ackSegmentReadQueueFree = ackSegmentDataMaxSN + 3     // 接收队列的空闲
-	ackSegmentSN            = ackSegmentReadQueueFree + 2 // ack的递增sn，sn更新才能更新ackSegmentReadQueueFree
-	ackSegmentLength        = ackSegmentSN + 4            // 长度
+	ackSegmentTimestamp     = ackSegmentReadQueueFree + 2 // ack的递增sn，sn更新才能更新ackSegmentReadQueueFree
+	ackSegmentLength        = ackSegmentTimestamp + 8     // 长度
 )
 
 const (
@@ -82,37 +80,7 @@ const (
 )
 
 var (
-	segmentPool  sync.Pool
-	checkSegment = []func(seg *segment) bool{
-		func(seg *segment) bool {
-			fmt.Println("dial segment from", seg.a)
-			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
-		}, // dialSegment
-		func(seg *segment) bool {
-			fmt.Println("accept segment from", seg.a)
-			return seg.b[connectSegmentVersion] == protolVersion && seg.n == connectSegmentLength
-		}, // acceptSegment
-		func(seg *segment) bool {
-			fmt.Println("reject segment from", seg.a)
-			return seg.b[rejectSegmentVersion] == protolVersion && seg.n == rejectSegmentLength
-		}, // rejectSegment
-		func(seg *segment) bool {
-			fmt.Println("data segment from", seg.a)
-			return seg.n >= dataSegmentPayload
-		}, // dataSegment
-		func(seg *segment) bool {
-			fmt.Println("ack segment from", seg.a)
-			return seg.n == ackSegmentLength
-		}, // ackSegment
-		func(seg *segment) bool {
-			fmt.Println("close segment from", seg.a)
-			return seg.n == closeSegmentLength
-		}, // closeSegment
-		func(seg *segment) bool {
-			fmt.Println("invalid segment from", seg.a)
-			return seg.n == invalidSegmentLength
-		}, // invalidSegment
-	}
+	segmentPool sync.Pool
 )
 
 func init() {
@@ -126,6 +94,25 @@ type segment struct {
 	b [maxMTU]byte
 	n int
 	a *net.UDPAddr
+}
+
+func (s *segment) String() string {
+	switch s.b[0] {
+	case dialSegment:
+		return "dial segment"
+	case acceptSegment:
+		return "accept segment"
+	case rejectSegment:
+		return "reject segment"
+	case dataSegment:
+		return "data segment"
+	case ackSegment:
+		return "ack segment"
+	case closeSegment:
+		return "close segment"
+	default:
+		return "invalid segment"
+	}
 }
 
 func uint24(b []byte) uint32 {

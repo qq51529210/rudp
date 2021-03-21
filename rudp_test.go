@@ -14,7 +14,9 @@ func Test_RUDP(t *testing.T) {
 	wait.Add(2)
 	clientHash := md5.New()
 	serverHash := md5.New()
+	var multiple = 10
 	var serverError, clientError error
+	var serverBytes, clientBytes int
 	var serverAddress = "127.0.0.1:20000"
 	var clientAddress = "127.0.0.1:30000"
 	server, err := Listen(serverAddress)
@@ -46,6 +48,7 @@ func Test_RUDP(t *testing.T) {
 				}
 				return
 			}
+			serverBytes += n
 			serverHash.Write(buff[:n])
 		}
 	}()
@@ -61,18 +64,20 @@ func Test_RUDP(t *testing.T) {
 			return
 		}
 		buff := make([]byte, 1024)
-		for i := 0; i < 1; i++ {
+		for i := 0; i < multiple; i++ {
 			mathRand.Read(buff)
 			n, err := conn.Write(buff)
 			if err != nil {
 				clientError = err
 				return
 			}
+			clientBytes += n
 			clientHash.Write(buff[:n])
 		}
 		conn.Close()
 	}()
 	wait.Wait()
+	t.Log(serverBytes, clientBytes)
 	if serverError != nil {
 		t.Fatal(serverError)
 	}
