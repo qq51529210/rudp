@@ -62,11 +62,11 @@ const (
 )
 
 const (
-	ackSegmentDataSN        = segmentToken + 4            // 数据包的sn
-	ackSegmentDataMaxSN     = ackSegmentDataSN + 3        // 已收到数据包的最大sn
-	ackSegmentReadQueueFree = ackSegmentDataMaxSN + 3     // 接收队列的空闲
-	ackSegmentTimestamp     = ackSegmentReadQueueFree + 2 // ack的递增sn，sn更新才能更新ackSegmentReadQueueFree
-	ackSegmentLength        = ackSegmentTimestamp + 8     // 长度
+	ackSegmentDataSN          = segmentToken + 4              // 数据包的sn
+	ackSegmentDataMaxSN       = ackSegmentDataSN + 3          // 已收到数据包的最大sn
+	ackSegmentReadQueueLength = ackSegmentDataMaxSN + 3       // 接收队列的空闲
+	ackSegmentTimestamp       = ackSegmentReadQueueLength + 2 // ack的递增sn，sn更新才能更新ackSegmentReadQueueFree
+	ackSegmentLength          = ackSegmentTimestamp + 8       // 长度
 )
 
 const (
@@ -76,7 +76,8 @@ const (
 )
 
 const (
-	invalidSegmentLength = segmentToken + 4
+	invalidSegmentTimestamp = segmentToken + 4
+	invalidSegmentLength    = invalidSegmentTimestamp + 8
 )
 
 var (

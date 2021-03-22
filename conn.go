@@ -1,7 +1,6 @@
 package rudp
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
@@ -67,12 +66,13 @@ type readData struct {
 
 // writeQueue的数据块
 type writeData struct {
-	sn    uint32       // 序号，24位
-	buff  [maxMSS]byte // 数据
-	len   uint16       // 数据大小，因为write有可能写不完数据块
-	next  *writeData   // 下一个
-	first time.Time    // 第一次被发送的时间，用于计算rto
-	last  time.Time    // 上一次被发送的时间，超时重发判断
+	sn    uint32        // 序号，24位
+	buff  [maxMSS]byte  // 数据
+	len   uint16        // 数据大小，因为write有可能写不完数据块
+	next  *writeData    // 下一个
+	first time.Time     // 第一次被发送的时间，用于计算rto
+	last  time.Time     // 上一次被发送的时间，超时重发判断
+	rto   time.Duration // 超时重发
 }
 
 type Conn struct {
@@ -131,7 +131,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 			c.readLock.Unlock()
 			if n == 0 {
 				// 被关闭连接
-				if c.state&closedState != 0 {
+				if c.state&shutdownState != 0 {
 					return 0, io.EOF
 				}
 				// 连接状态
@@ -145,13 +145,13 @@ func (c *Conn) Read(b []byte) (int, error) {
 					}
 				}
 				// 主动关闭，或无效
-				return 0, c.netOpError("read", connClosedError)
+				return 0, c.netOpError("read", errConnClosed)
 			}
 			return n, nil
 		}
 	}
 	// 设置了超时
-	duration := c.readTimeout.Sub(time.Now())
+	duration := time.Until(c.readTimeout)
 	c.readLock.RUnlock()
 	if duration <= 0 {
 		return 0, c.netOpError("read", new(timeoutError))
@@ -164,7 +164,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 		c.readLock.Unlock()
 		if n == 0 {
 			// 被关闭连接
-			if c.state&closedState != 0 {
+			if c.state&shutdownState != 0 {
 				return 0, io.EOF
 			}
 			// 连接状态
@@ -180,7 +180,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 				}
 			}
 			// 主动关闭，或无效
-			return 0, c.netOpError("read", connClosedError)
+			return 0, c.netOpError("read", errConnClosed)
 		}
 		return n, nil
 	}
@@ -195,7 +195,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		c.writeLock.RUnlock()
 		for {
 			if c.state != connectState {
-				return 0, c.netOpError("write", connClosedError)
+				return 0, c.netOpError("write", errConnClosed)
 			}
 			c.writeLock.Lock()
 			n = c.addWriteData(b[m:])
@@ -205,7 +205,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 				case <-c.writeSignle:
 					continue
 				case <-c.stateSignal:
-					return 0, c.netOpError("write", connClosedError)
+					return 0, c.netOpError("write", errConnClosed)
 				}
 			}
 			m += n
@@ -215,7 +215,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		}
 	}
 	// 设置了超时
-	duration := c.writeTimeout.Sub(time.Now())
+	duration := time.Until(c.writeTimeout)
 	c.writeLock.RUnlock()
 	if duration <= 0 {
 		return 0, c.netOpError("write", new(timeoutError))
@@ -224,7 +224,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 	defer timer.Stop()
 	for {
 		if c.state != connectState {
-			return 0, c.netOpError("write", connClosedError)
+			return 0, c.netOpError("write", errConnClosed)
 		}
 		c.writeLock.Lock()
 		n = c.addWriteData(b[m:])
@@ -236,7 +236,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 			case <-c.writeSignle:
 				continue
 			case <-c.stateSignal:
-				return 0, c.netOpError("write", connClosedError)
+				return 0, c.netOpError("write", errConnClosed)
 			}
 		}
 		m += n
@@ -252,7 +252,7 @@ func (c *Conn) Close() error {
 	c.lock.Lock()
 	if c.state != connectState {
 		c.lock.Unlock()
-		return c.netOpError("close", connClosedError)
+		return c.netOpError("close", errConnClosed)
 	}
 	c.state |= shutdownState
 	c.lock.Unlock()
@@ -309,14 +309,16 @@ func (c *Conn) RemoteListenAddr() net.Addr {
 
 // local地址是否nat(Network Address Translation)
 func (c *Conn) IsNat() bool {
-	return bytes.Compare(c.localListenAddr.IP.To16(), c.localInternetAddr.IP.To16()) == 0 &&
-		c.localListenAddr.Port == c.localInternetAddr.Port
+	ip1 := c.localListenAddr.IP.To16()
+	ip2 := c.localInternetAddr.IP.To16()
+	return ip1.Equal(ip2) && c.localListenAddr.Port == c.localInternetAddr.Port
 }
 
 // remote地址是否在nat(Network Address Translation)
 func (c *Conn) IsRemoteNat() bool {
-	return bytes.Compare(c.remoteListenAddr.IP.To16(), c.remoteInternetAddr.IP.To16()) == 0 &&
-		c.remoteListenAddr.Port == c.remoteInternetAddr.Port
+	ip1 := c.remoteListenAddr.IP.To16()
+	ip2 := c.remoteInternetAddr.IP.To16()
+	return ip1.Equal(ip2) && c.remoteListenAddr.Port == c.remoteInternetAddr.Port
 }
 
 // 设置最小rto
@@ -403,15 +405,18 @@ func (c *Conn) calculateRTO(rtt time.Duration) {
 
 // 读取连续的数据，返回0表示没有数据，返回-1表示io.EOF
 func (c *Conn) read(b []byte) int {
-	n, m := 0, 0
-	if c.readSN < c.readHead.sn {
-		// 456...123
-	} else {
-		// ...123456...
+	if c.readHead == nil {
+		return 0
 	}
-	for c.readHead != nil {
-		if c.readHead.sn > c.readSN {
-			break
+	n, m := 0, 0
+	for {
+		if c.readSN >= c.readHead.sn {
+			// ...1,2,3,readSN,4,5,6...
+			if c.readHead.sn > c.readSN {
+				break
+			}
+			// } else {
+			// 4,readSN,5,6...1,2,3
 		}
 		// 拷贝数据到buf
 		m = copy(b[n:], c.readHead.data[c.readHead.idx:c.readHead.len])
@@ -421,8 +426,8 @@ func (c *Conn) read(b []byte) int {
 		if c.readHead.idx >= c.readHead.len {
 			c.removeReadDataFront()
 		}
-		// buf满了
-		if n == len(b) {
+		// 没有数据，或者buf满了
+		if c.readHead == nil || n == len(b) {
 			return n
 		}
 	}
@@ -445,7 +450,7 @@ func (c *Conn) newWriteData() *writeData {
 	d.sn = c.writeSN
 	c.writeSN++
 	// 24位溢出
-	if c.writeSN >= maxDataSN {
+	if c.writeSN > maxDataSN {
 		c.writeSN = 0
 	}
 	d.next = nil
@@ -459,21 +464,21 @@ func (c *Conn) newWriteData() *writeData {
 }
 
 // 尝试添加一个数据块，成功返回true
-func (c *Conn) addReadData(sn uint32, data []byte) {
+func (c *Conn) addReadData(sn uint32, data []byte) bool {
 	// 是否在接收范围
 	maxSN := c.readSN + uint32(c.readCap)
 	if maxSN > maxDataSN {
 		// 溢出的情况
 		maxSN -= maxDataSN
 		if sn < c.readSN && sn > maxSN {
-			return
+			return false
 		}
 		if c.readHead == nil {
 			c.readHead = c.newReadData(sn, data, nil)
 		} else {
 			p := c.readHead
 			if sn == p.sn {
-				return
+				return false
 			}
 			if sn < p.sn {
 				c.readHead = c.newReadData(sn, data, p)
@@ -482,7 +487,7 @@ func (c *Conn) addReadData(sn uint32, data []byte) {
 				p = p.next
 				for p != nil {
 					if sn == p.sn {
-						return
+						return false
 					}
 					if sn >= c.readSN && sn < p.sn {
 						break
@@ -497,14 +502,14 @@ func (c *Conn) addReadData(sn uint32, data []byte) {
 		}
 	} else {
 		if sn < c.readSN || sn > maxSN {
-			return
+			return false
 		}
 		if c.readHead == nil {
 			c.readHead = c.newReadData(sn, data, nil)
 		} else {
 			p := c.readHead
 			if sn == p.sn {
-				return
+				return false
 			}
 			if sn < p.sn {
 				c.readHead = c.newReadData(sn, data, p)
@@ -513,7 +518,7 @@ func (c *Conn) addReadData(sn uint32, data []byte) {
 				p = p.next
 				for p != nil {
 					if sn == p.sn {
-						return
+						return false
 					}
 					if sn < p.sn {
 						break
@@ -534,12 +539,13 @@ func (c *Conn) addReadData(sn uint32, data []byte) {
 		}
 		p = p.next
 	}
+	return true
 }
 
 // 写入数据，返回0表示队列满了无法写入
 func (c *Conn) addWriteData(data []byte) int {
 	// 还能添加多少个数据包
-	maxAdd := c.dataCap[1] - c.writeLen
+	maxAdd := c.writeCap - c.writeLen
 	if maxAdd <= 0 {
 		return 0
 	}
@@ -583,129 +589,196 @@ func (c *Conn) removeReadDataFront() {
 	readDataPool.Put(d)
 }
 
-// 移除sn前面的所有数据包
-func (c *Conn) removeWriteDataBefore(sn uint32) bool {
-	// 检查sn是否在发送窗口范围
-	if c.writeHead == nil {
-		return false
-	}
-	// 第一个
-	p := c.writeHead
-	if sn == p.sn {
-		c.calculateRTO(time.Now().Sub(p.first))
-		c.writeHead = p.next
-		writeDataPool.Put(p)
+// 移除发送队列小于sn的数据包
+func (c *Conn) removeWriteDataBefore(p *writeData, sn uint32) *writeData {
+	for p != nil {
+		if sn < p.sn {
+			break
+		}
+		if sn == p.sn {
+			c.calculateRTO(time.Until(p.first))
+		}
+		n := p
+		p = p.next
+		writeDataPool.Put(n)
 		c.writeLen--
-		if c.writeHead == nil {
-			c.writeTail = nil
-		}
-		return true
 	}
-	n := p.next
-	if c.writeHead.sn > c.writeSN {
-		// 0123...789
-		if sn < c.writeHead.sn && sn > c.writeSN {
-			return false
-		}
-		if sn < c.writeSN {
-			for n != nil {
-				if p.sn > n.sn {
-					break
-				}
-				p = n
-				n = p.next
-			}
-		}
-	} else {
-		// ...345678...
-		if sn < c.writeHead.sn && sn > c.writeSN {
-			return false
-		}
-	}
-	for n != nil {
-		// 因为是递增有序队列，sn如果小于当前，就没必要继续
-		if sn < n.sn {
-			break
-		}
-		if sn == n.sn {
-			c.calculateRTO(time.Now().Sub(n.first))
-			p.next = n.next
-			writeDataPool.Put(n)
-			c.writeLen--
-			if p.next == nil {
-				c.writeTail = p
-			}
-			break
-		}
-		p = n
-		n = p.next
-	}
-	c.writeHead = p
-	return false
+	return p
 }
 
-// 移除指定sn数据包，成功返回true
-func (c *Conn) removeWriteData(sn uint32) bool {
-	// 检查sn是否在发送窗口范围
-	if c.writeHead == nil {
-		return false
-	}
-	// 第一个
+// 移除发送队列指定sn的数据包
+func (c *Conn) removeWriteDataAt(sn uint32) bool {
 	p := c.writeHead
+	// 第一个
 	if sn == p.sn {
-		c.calculateRTO(time.Now().Sub(p.first))
+		c.calculateRTO(time.Until(p.first))
 		c.writeHead = p.next
 		writeDataPool.Put(p)
 		c.writeLen--
-		if c.writeHead == nil {
-			c.writeTail = nil
+		if p.next == nil {
+			c.writeTail = p
 		}
 		return true
 	}
+	// 剩下的
 	n := p.next
-	if c.writeHead.sn <= c.writeTail.sn {
-		// ...345678...
-		if sn < c.writeHead.sn || sn > c.writeTail.sn {
-			return false
-		}
-	} else {
-		// 0123...789
-		if sn < c.writeHead.sn && sn > c.writeTail.sn {
-			return false
-		}
-		n = p.next
-		// 0123...
-		if sn <= c.writeTail.sn {
-			// 先找到溢出的部分
-			for n != nil {
-				// 后一个小于前一个，溢出
-				if n.sn < p.sn {
-					break
-				}
-				p = n
-				n = p.next
-			}
-		}
-	}
 	for n != nil {
-		// 因为是递增有序队列，sn如果小于当前，就没必要继续
 		if sn < n.sn {
 			return false
 		}
 		if sn == n.sn {
-			c.calculateRTO(time.Now().Sub(p.first))
+			c.calculateRTO(time.Until(n.first))
 			p.next = n.next
+			writeDataPool.Put(n)
+			c.writeLen--
 			if p.next == nil {
 				c.writeTail = p
 			}
-			writeDataPool.Put(n)
-			c.writeLen--
 			return true
 		}
 		p = n
-		n = p.next
+		n = n.next
 	}
 	return false
+}
+
+// 移除发送队列的数据包
+func (c *Conn) removeWriteData(sn, maxSN uint32) bool {
+	// 检查sn是否在发送窗口范围
+	if c.writeHead == nil {
+		return false
+	}
+	if c.writeHead.sn <= c.writeTail.sn {
+		// sn没溢出，...3,4,5,6,7,8...
+		if sn < c.writeHead.sn || sn > c.writeTail.sn || maxSN < c.writeHead.sn || maxSN > c.writeTail.sn {
+			return false
+		}
+		// 原来的数量
+		writeLen := c.writeLen
+		// 移除小于maxSN
+		c.writeHead = c.removeWriteDataBefore(c.writeHead, maxSN)
+		if c.writeHead == nil {
+			c.writeTail = nil
+			return writeLen != c.writeLen
+		}
+		// 移除sn，下面两种情况
+		// ...3,4,sn,5,6,maxSN,7,8...，已
+		// ...3,4,5,maxSN,6,7,sn,8...，未
+		if c.writeHead != nil && sn > maxSN && c.removeWriteDataAt(sn) {
+			return true
+		}
+		return writeLen != c.writeLen
+	} else {
+		// sn溢出，5,6,7,8,9...2,3,4
+		if (sn < c.writeHead.sn && sn > c.writeTail.sn) || (maxSN < c.writeHead.sn && maxSN > c.writeTail.sn) {
+			return false
+		}
+		// 原来的数量
+		writeLen := c.writeLen
+		// 移除小于maxSN的数据
+		if maxSN <= c.writeTail.sn {
+			// 5,6,7,maxSN,9...2,3,4
+			p := c.writeHead
+			// 先移除...2,3,4
+			for p != nil {
+				if p.sn < c.writeTail.sn {
+					break
+				}
+				n := p
+				p = p.next
+				writeDataPool.Put(n)
+				c.writeLen--
+			}
+			// 移除5,6,7,maxSN,...
+			c.writeHead = c.removeWriteDataBefore(p, maxSN)
+			if c.writeHead == nil {
+				c.writeTail = nil
+				return writeLen != c.writeLen
+			}
+			// 移除sn，下面三种情况
+			// 5,6,7,maxSN,9...2,3,sn,4，已
+			// 5,sn,6,7,maxSN,9...2,3,4，已
+			// 5,6,maxSN,7,sn,9...2,3,4，未
+			if c.writeHead != nil && sn < c.writeTail.sn && sn > maxSN && c.removeWriteDataAt(sn) {
+				return true
+			}
+		} else {
+			// 5,6,7,9...2,3,maxSN,4
+			c.writeHead = c.removeWriteDataBefore(c.writeHead, maxSN)
+			if c.writeHead == nil {
+				c.writeTail = nil
+				return writeLen != c.writeLen
+			}
+			// 移除sn，下面三种情况
+			// 5,6,7,9...2,sn,3,maxSN,4，已
+			// 5,6,7,9...2,3,maxSN,sn,4，未
+			// 5,6,sn,7,9...2,3,maxSN,4，未
+			if c.writeHead != nil {
+				if sn >= c.writeHead.sn {
+					// 5,6,7,9...2,3,maxSN,sn,4，未
+					if sn > maxSN && c.removeWriteDataAt(sn) {
+						return true
+					}
+				} else {
+					// 5,6,sn,7,9...2,3,maxSN,4，未
+					p := c.writeHead
+					if p.sn <= c.writeTail.sn {
+						if sn == p.sn {
+							c.calculateRTO(time.Until(p.first))
+							c.writeHead = p.next
+							writeDataPool.Put(p)
+							c.writeLen--
+							if p.next == nil {
+								c.writeTail = p
+							}
+							return true
+						}
+					} else {
+						// 遍历末尾到溢出的开始
+						n := p.next
+						for n != nil {
+							if n.sn < c.writeTail.sn {
+								break
+							}
+							p = n
+							n = n.next
+						}
+						if sn == n.sn {
+							c.calculateRTO(time.Until(n.first))
+							p.next = n.next
+							writeDataPool.Put(n)
+							c.writeLen--
+							if p.next == nil {
+								c.writeTail = p
+							}
+							return true
+						}
+						p = n
+					}
+					// 剩下的
+					n := p.next
+					for n != nil {
+						if sn < n.sn {
+							return false
+						}
+						if sn == n.sn {
+							c.calculateRTO(time.Until(n.first))
+							p.next = n.next
+							writeDataPool.Put(n)
+							c.writeLen--
+							if p.next == nil {
+								c.writeTail = p
+							}
+							return true
+						}
+						p = n
+						n = n.next
+					}
+				}
+			}
+		}
+		return writeLen != c.writeLen
+	}
 }
 
 // 检查发送队列，超时重发
@@ -735,9 +808,13 @@ func (c *Conn) checkRTO(now time.Time, rudp *RUDP) {
 			n--
 		} else {
 			// 超时重传
-			if now.Sub(p.last) >= c.rto {
+			if now.Sub(p.last) >= p.rto {
 				rudp.WriteToConn(p.buff[:p.len], c)
 				p.last = now
+				p.rto += c.rto
+				if p.rto > c.maxRTO {
+					p.rto = c.maxRTO
+				}
 				n--
 			}
 		}
@@ -793,7 +870,7 @@ func (c *Conn) encAckSegment(seg *segment, sn uint32) {
 	binary.BigEndian.PutUint32(seg.b[segmentToken:], c.token)
 	putUint24(seg.b[ackSegmentDataSN:], sn)
 	putUint24(seg.b[ackSegmentDataMaxSN:], c.readSN-1)
-	binary.BigEndian.PutUint16(seg.b[ackSegmentReadQueueFree:], c.readCap-c.readLen)
+	binary.BigEndian.PutUint16(seg.b[ackSegmentReadQueueLength:], c.readCap-c.readLen)
 	binary.BigEndian.PutUint64(seg.b[ackSegmentTimestamp:], c.writeAckSN)
 	c.writeAckSN++
 }

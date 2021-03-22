@@ -14,7 +14,7 @@ func Test_RUDP(t *testing.T) {
 	wait.Add(2)
 	clientHash := md5.New()
 	serverHash := md5.New()
-	var multiple = 10
+	var multiple = 20
 	var serverError, clientError error
 	var serverBytes, clientBytes int
 	var serverAddress = "127.0.0.1:20000"
@@ -63,6 +63,7 @@ func Test_RUDP(t *testing.T) {
 			clientError = err
 			return
 		}
+		conn.SetWriteBuffer(minMSS * 10)
 		buff := make([]byte, 1024)
 		for i := 0; i < multiple; i++ {
 			mathRand.Read(buff)
@@ -85,7 +86,7 @@ func Test_RUDP(t *testing.T) {
 		t.Fatal(clientError)
 	}
 	// 比较传输的数据哈希值
-	if bytes.Compare(clientHash.Sum(nil), serverHash.Sum(nil)) != 0 {
+	if !bytes.Equal(clientHash.Sum(nil), serverHash.Sum(nil)) {
 		t.FailNow()
 	}
 }
