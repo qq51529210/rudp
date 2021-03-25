@@ -162,11 +162,17 @@ func (r *RUDP) Close() error {
 // net.Listener接口
 func (r *RUDP) Accept() (net.Conn, error) {
 	r.acceptCond.L.Lock()
-	for r.acceptConn.Len() < 1 {
+	for !r.closed && r.acceptConn.Len() < 1 {
 		r.acceptCond.Wait()
+	}
+	if r.closed {
+		r.acceptCond.L.Unlock()
+		return nil, r.netOpError("accept", errRudpClosed)
 	}
 	conn := r.acceptConn.Remove(r.acceptConn.Front()).(*Conn)
 	r.acceptCond.L.Unlock()
+	r.waitGroup.Add(1)
+	go r.connHandleSegmentRoutine(conn)
 	return conn, nil
 }
 
@@ -177,11 +183,16 @@ func (r *RUDP) Dial(address string, timeout time.Duration) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	// client Conn
 	// 探测mss
 	mss, rtt, err := DetectLink(addr)
 	if err != nil {
 		return nil, err
+	}
+	if mss > maxMSS {
+		mss = maxMSS
+	}
+	if mss < minMSS {
+		mss = minMSS
 	}
 	// 注册到connection表
 	var key connKey
@@ -216,21 +227,28 @@ func (r *RUDP) Dial(address string, timeout time.Duration) (*Conn, error) {
 	r.initConn(conn, addr, clientSegment, key.token)
 	conn.timestamp = uint64(time.Now().Unix())
 	conn.writeMSS = mss
-	conn.rtt = rtt
+	conn.initRTO(rtt)
 	r.waitGroup.Add(1)
-	go r.connRoutine(conn)
+	go r.connHandleSegmentRoutine(conn)
 	// 初始化dialSegment
 	conn.encConnectSegment(conn.buff[:], dialSegment)
+	timeout -= r.connectRTO
 	for {
 		select {
-		case <-time.After(timeout): // 连接超时
-			err = new(timeoutError)
-		case <-conn.timer.C: // 超时重传
-			r.WriteToConn(conn.buff[:connectSegmentLength], conn)
-			conn.timer.Reset(r.connectRTO)
+		case now := <-conn.timer.C:
+			if time.Until(now) >= timeout {
+				// 连接超时
+				err = new(timeoutError)
+			} else {
+				// 超时重传
+				r.WriteToConn(conn.buff[:connectSegmentLength], conn)
+				conn.timer.Reset(r.connectRTO)
+			}
 		case state := <-conn.stateSignal: // 连接信号
 			switch state {
 			case connectState: // 已连接，返回
+				r.waitGroup.Add(1)
+				go r.connCheckRTORoutine(conn)
 				return conn, nil
 			case dialState: // 拒绝连接，返回
 				err = errors.New("connect reject")
@@ -292,9 +310,65 @@ func (r *RUDP) netOpError(op string, err error) error {
 	}
 }
 
+// 初始化Conn的一些变量
+func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from byte, token uint32) {
+	conn.from = from
+	conn.token = token
+	conn.state = dialState
+	conn.stateSignal = make(chan byte, 1)
+	conn.handleQueue = make(chan *segment, r.connHandleQueue)
+	conn.localListenAddr = r.conn.LocalAddr().(*net.UDPAddr)
+	conn.remoteListenAddr = new(net.UDPAddr)
+	conn.remoteListenAddr.IP = make(net.IP, net.IPv6len)
+	conn.localInternetAddr = new(net.UDPAddr)
+	conn.localInternetAddr.IP = make(net.IP, net.IPv6len)
+	conn.remoteInternetAddr = addr
+	conn.readSignle = make(chan byte, 1)
+	conn.writeSignle = make(chan byte, 1)
+	conn.readCap = connReadQueue
+	conn.writeCap = connWriteQueue
+	conn.timer = time.NewTimer(0)
+	// test
+	conn.readSN = maxDataSN - 20
+	conn.writeSN = conn.readSN
+}
+
+// 从连接池中移除Conn
+func (r *RUDP) removeConn(conn *Conn) {
+	// 修改状态
+	conn.lock.Lock()
+	if conn.state&invalidState != 0 {
+		conn.lock.Unlock()
+		return
+	}
+	conn.state |= invalidState
+	conn.lock.Unlock()
+	// 移除
+	from := (^conn.from) >> 7
+	var key connKey
+	key.Init(conn.remoteInternetAddr)
+	key.token = conn.token
+	r.lock[from].Lock()
+	delete(r.connection[from], key)
+	r.lock[from].Unlock()
+	// 释放资源
+	close(conn.stateSignal)
+	close(conn.readSignle)
+	close(conn.writeSignle)
+	conn.releaseReadData()
+	conn.releaseWriteData()
+	close(conn.handleQueue)
+	for seg := range conn.handleQueue {
+		segmentPool.Put(seg)
+	}
+}
+
 // 读取并处理udp数据包
 func (r *RUDP) handleUDPDataRoutine() {
-	defer r.waitGroup.Done()
+	defer func() {
+		r.waitGroup.Done()
+		fmt.Println("handleUDPDataRoutine exit")
+	}()
 	var err error
 	var from byte
 	var conn *Conn
@@ -342,7 +416,7 @@ func (r *RUDP) handleUDPDataRoutine() {
 				r.lock[1].Unlock()
 				r.initConn(conn, seg.a, serverSegment, key.token)
 				r.waitGroup.Add(1)
-				go r.connRoutine(conn)
+				go r.connHandleSegmentRoutine(conn)
 			} else {
 				// 有相应的Conn，但是timestamp比较新，说明是新的dialSegment
 				if timestamp > conn.timestamp {
@@ -356,7 +430,7 @@ func (r *RUDP) handleUDPDataRoutine() {
 					r.initConn(conn, seg.a, serverSegment, key.token)
 					// 启动routine
 					r.waitGroup.Add(1)
-					go r.connRoutine(conn)
+					go r.connHandleSegmentRoutine(conn)
 					// 在routine中移除
 					if old.state&invalidState == 0 {
 						r.waitGroup.Add(1)
@@ -407,65 +481,12 @@ func (r *RUDP) handleUDPDataRoutine() {
 	}
 }
 
-// 初始化Conn的一些变量
-func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from byte, token uint32) {
-	conn.from = from
-	conn.token = token
-	conn.state = dialState
-	conn.stateSignal = make(chan byte, 1)
-	conn.handleQueue = make(chan *segment, r.connHandleQueue)
-	conn.localListenAddr = r.conn.LocalAddr().(*net.UDPAddr)
-	conn.remoteListenAddr = new(net.UDPAddr)
-	conn.localInternetAddr = new(net.UDPAddr)
-	conn.remoteInternetAddr = addr
-	conn.readSignle = make(chan byte, 1)
-	conn.writeSignle = make(chan byte, 1)
-	conn.readCap = connReadQueue
-	conn.writeCap = connWriteQueue
-	conn.minRTO = connMinRTO
-	conn.maxRTO = connMaxRTO
-	conn.timer = time.NewTimer(0)
-	// test
-	conn.readSN = maxDataSN - 20
-	conn.writeSN = conn.readSN
-}
-
-// 从连接池中移除Conn
-func (r *RUDP) removeConn(conn *Conn) {
-	// 修改状态
-	conn.lock.Lock()
-	if conn.state&invalidState != 0 {
-		conn.lock.Unlock()
-		return
-	}
-	conn.state |= invalidState
-	conn.lock.Unlock()
-	// 移除
-	from := (^conn.from) >> 7
-	var key connKey
-	key.Init(conn.remoteInternetAddr)
-	key.token = conn.token
-	r.lock[from].Lock()
-	delete(r.connection[from], key)
-	r.lock[from].Unlock()
-	// 释放资源
-	close(conn.stateSignal)
-	close(conn.readSignle)
-	close(conn.writeSignle)
-	conn.releaseReadData()
-	conn.releaseWriteData()
-	close(conn.handleQueue)
-	for seg := range conn.handleQueue {
-		segmentPool.Put(seg)
-	}
-}
-
 // Conn处理消息和超时重发数据
-func (r *RUDP) connRoutine(conn *Conn) {
+func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 	defer func() {
-		conn.timer.Stop()
 		r.removeConn(conn)
 		r.waitGroup.Done()
+		fmt.Println("connHandleSegmentRoutine exit")
 	}()
 	for !r.closed {
 		select {
@@ -473,11 +494,6 @@ func (r *RUDP) connRoutine(conn *Conn) {
 			return
 		case <-conn.stateSignal: // Conn关闭信号
 			return
-		case now := <-conn.timer.C: // 超时重传检查
-			conn.writeLock.Lock()
-			conn.checkRTO(now, r)
-			conn.writeLock.Unlock()
-			conn.timer.Reset(conn.rto)
 		case seg, ok := <-conn.handleQueue: // 消息处理
 			if !ok {
 				return
@@ -485,6 +501,7 @@ func (r *RUDP) connRoutine(conn *Conn) {
 			conn.readBytes += uint64(seg.n)
 			switch seg.b[0] {
 			case dialSegment:
+				fmt.Println(seg.a, "dial segment")
 				conn.lock.Lock()
 				switch conn.state {
 				case dialState:
@@ -495,8 +512,14 @@ func (r *RUDP) connRoutine(conn *Conn) {
 					if err != nil {
 						return
 					}
+					if mss > maxMSS {
+						mss = maxMSS
+					}
+					if mss < minMSS {
+						mss = minMSS
+					}
 					conn.writeMSS = mss
-					conn.rtt = rtt
+					conn.initRTO(rtt)
 					// 解析acceptSegment字段
 					conn.decConnectSegment(seg)
 					// 加入acceptConn等待应用层Accept()
@@ -516,6 +539,7 @@ func (r *RUDP) connRoutine(conn *Conn) {
 					conn.lock.Unlock()
 				}
 			case acceptSegment:
+				fmt.Println(seg.a, "accept segment")
 				conn.lock.Lock()
 				switch conn.state {
 				case dialState:
@@ -540,6 +564,7 @@ func (r *RUDP) connRoutine(conn *Conn) {
 				if conn.timestamp != timestamp {
 					break
 				}
+				fmt.Println(seg.a, "reject segment", "timestamp", timestamp)
 				conn.lock.Lock()
 				switch conn.state {
 				case dialState:
@@ -608,6 +633,28 @@ func (r *RUDP) connRoutine(conn *Conn) {
 				return
 			}
 			segmentPool.Put(seg)
+		}
+	}
+}
+
+func (r *RUDP) connCheckRTORoutine(conn *Conn) {
+	defer func() {
+		conn.timer.Stop()
+		r.waitGroup.Done()
+		fmt.Println("connCheckRTORoutine exit")
+	}()
+	conn.timer.Reset(conn.rto)
+	for !r.closed {
+		select {
+		case <-r.closeSignal: // RUDP关闭信号
+			return
+		case <-conn.stateSignal: // Conn关闭信号
+			return
+		case now := <-conn.timer.C: // 超时重传检查
+			conn.writeLock.Lock()
+			conn.checkRTO(now, r)
+			conn.writeLock.Unlock()
+			conn.timer.Reset(conn.rto)
 		}
 	}
 }

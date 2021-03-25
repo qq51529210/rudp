@@ -27,7 +27,7 @@ var (
 	connWriteQueue  = uint16(128)             // 默认的conn的发送队列长度
 	connReadQueue   = uint16(128)             // 默认的conn的接收队列长度
 	connHandleQueue = uint16(256)             // 默认的conn的处理队列长度
-	connMinRTO      = 30 * time.Millisecond   // 最小超时重传，毫秒
+	connMinRTO      = 100 * time.Millisecond  // 最小超时重传，毫秒
 	connMaxRTO      = 1000 * time.Millisecond // 最大超时重传，毫秒
 )
 
@@ -57,17 +57,16 @@ func (e timeoutError) Timeout() bool { return true }
 
 // readQueue的数据块
 type readData struct {
-	sn   uint32       // 序号，24位
-	data [maxMSS]byte // 数据
-	len  uint16       // 数据大小
-	idx  uint16       // 有效数据的起始，因为read有可能一次读不完数据
-	next *readData    // 下一个
+	sn   uint32    // 序号，24位
+	data []byte    // 数据
+	idx  uint16    // 有效数据的起始，因为read有可能一次读不完数据
+	next *readData // 下一个
 }
 
 // writeQueue的数据块
 type writeData struct {
 	sn    uint32        // 序号，24位
-	buff  [maxMSS]byte  // 数据
+	buff  []byte        // 数据
 	len   uint16        // 数据大小，因为write有可能写不完数据块
 	next  *writeData    // 下一个
 	first time.Time     // 第一次被发送的时间，用于计算rto
@@ -102,10 +101,12 @@ type Conn struct {
 	writeLen           uint16        // 发送队列长度
 	readCap            uint16        // 接收队列最大长度
 	writeCap           uint16        // 发送队列最大长度
-	readSN             uint32        // 接收队列的可读sn
+	readSN             uint32        // 接收队列的连续数据最大sn
 	writeSN            uint32        // 发送队列的下一个sn
 	remoteWriteMSS     uint16        // 接收队列的mss，remote发送队列的mss
 	writeMSS           uint16        // 发送队列的mss
+	readDataHead       *readData     // 可读的数据头
+	readDataTail       *readData     // 可读的数据尾
 	readHead           *readData     // 接收队列
 	writeHead          *writeData    // 发送队列
 	writeTail          *writeData    // 发送队列，添加时直接添加到末尾
@@ -390,6 +391,40 @@ func (c *Conn) netOpError(op string, err error) error {
 	}
 }
 
+// 返回一个*readData
+func (c *Conn) newReadData(sn uint32, data []byte, next *readData) *readData {
+	d := readDataPool.Get().(*readData)
+	d.sn = sn
+	d.idx = 0
+	d.data = d.data[:]
+	d.data = append(d.data, data...)
+	d.next = next
+	c.readLen++
+	return d
+}
+
+// 返回一个*writeData
+func (c *Conn) newWriteData() *writeData {
+	d := writeDataPool.Get().(*writeData)
+	d.sn = c.writeSN
+	c.writeSN++
+	// 24位溢出
+	if c.writeSN > maxDataSN {
+		c.writeSN = 0
+	}
+	d.next = nil
+	d.first = time.Time{}
+	if cap(d.buff) < int(c.writeMSS) {
+		d.buff = make([]byte, c.writeMSS)
+	}
+	d.buff[segmentType] = c.from | dataSegment
+	binary.BigEndian.PutUint32(d.buff[segmentToken:], c.token)
+	putUint24(d.buff[dataSegmentSN:], d.sn)
+	d.len = dataSegmentPayload
+	c.writeLen++
+	return d
+}
+
 // 计算rto
 func (c *Conn) calculateRTO(rtt time.Duration) {
 	c.avrRTO = (3*c.avrRTO + c.rtt - rtt) / 4
@@ -403,141 +438,157 @@ func (c *Conn) calculateRTO(rtt time.Duration) {
 	}
 }
 
+func (c *Conn) initRTO(rtt time.Duration) {
+	c.rtt = rtt
+	c.rto = rtt / 2
+	c.avrRTO = c.rto
+	c.minRTO = connMinRTO
+	c.maxRTO = connMaxRTO
+}
+
 // 读取连续的数据，返回0表示没有数据，返回-1表示io.EOF
 func (c *Conn) read(b []byte) int {
-	if c.readHead == nil {
+	if c.readDataHead == nil {
 		return 0
 	}
 	n, m := 0, 0
 	for {
-		if c.readSN >= c.readHead.sn {
-			// ...1,2,3,readSN,4,5,6...
-			if c.readHead.sn > c.readSN {
-				break
-			}
-			// } else {
-			// 4,readSN,5,6...1,2,3
-		}
 		// 拷贝数据到buf
-		m = copy(b[n:], c.readHead.data[c.readHead.idx:c.readHead.len])
+		m = copy(b[n:], c.readDataHead.data[c.readDataHead.idx:])
 		n += m
-		c.readHead.idx += uint16(m)
-		// 数据块数据拷贝完了，从队列中移除
-		if c.readHead.idx >= c.readHead.len {
-			c.removeReadDataFront()
+		c.readDataHead.idx += uint16(m)
+		// 数据块数据拷贝完了，移除
+		if int(c.readDataHead.idx) >= len(c.readDataHead.data) {
+			d := c.readDataHead
+			c.readDataHead = c.readDataHead.next
+			readDataPool.Put(d)
 		}
 		// 没有数据，或者buf满了
-		if c.readHead == nil || n == len(b) {
+		if c.readDataHead == nil {
+			c.readDataTail = nil
+			return n
+		}
+		if n == len(b) {
 			return n
 		}
 	}
-	return n
-}
-
-func (c *Conn) newReadData(sn uint32, data []byte, next *readData) *readData {
-	d := readDataPool.Get().(*readData)
-	d.sn = sn
-	d.idx = 0
-	d.len = uint16(copy(d.data[:], data))
-	d.next = next
-	c.readLen++
-	return d
-}
-
-// 新的添加到发送队列的writeData
-func (c *Conn) newWriteData() *writeData {
-	d := writeDataPool.Get().(*writeData)
-	d.sn = c.writeSN
-	c.writeSN++
-	// 24位溢出
-	if c.writeSN > maxDataSN {
-		c.writeSN = 0
-	}
-	d.next = nil
-	d.first = time.Time{}
-	d.buff[segmentType] = c.from | dataSegment
-	binary.BigEndian.PutUint32(d.buff[segmentToken:], c.token)
-	putUint24(d.buff[dataSegmentSN:], d.sn)
-	d.len = dataSegmentPayload
-	c.writeLen++
-	return d
 }
 
 // 尝试添加一个数据块，成功返回true
 func (c *Conn) addReadData(sn uint32, data []byte) bool {
+	// 正好是下一个sn
+	if sn == c.readSN {
+		// 直接添加到可读的队列
+		if c.readDataHead == nil {
+			c.readDataHead = c.newReadData(sn, data, nil)
+			c.readDataTail = c.readDataHead
+		} else {
+			c.readDataTail.next = c.newReadData(sn, data, nil)
+			c.readDataTail = c.readDataTail.next
+		}
+		c.readSN++
+		// 检查接收队列的sn，是否与readSN接上
+		for c.readHead != nil && c.readHead.sn == c.readSN {
+			// 添加到可读队列
+			c.readDataTail.next = c.readHead
+			// 下一个
+			c.readHead = c.readHead.next
+			c.readSN++
+			if c.readSN > maxDataSN {
+				c.readSN = 0
+			}
+		}
+		return true
+	}
 	// 是否在接收范围
 	maxSN := c.readSN + uint32(c.readCap)
 	if maxSN > maxDataSN {
-		// 溢出的情况
+		// 4,5,6,maxSN...head,1,2,3
 		maxSN -= maxDataSN
-		if sn < c.readSN && sn > maxSN {
-			return false
-		}
-		if c.readHead == nil {
-			c.readHead = c.newReadData(sn, data, nil)
-		} else {
-			p := c.readHead
-			if sn == p.sn {
-				return false
-			}
-			if sn < p.sn {
-				c.readHead = c.newReadData(sn, data, p)
+		if c.readSN > maxSN {
+			// 4,5,6,maxSN...head,readSN,3
+			if sn > maxSN {
+				// 4,5,6,maxSN...head,readSN,sn,3
+				if sn < c.readSN {
+					return false
+				}
 			} else {
-				n := p
-				p = p.next
-				for p != nil {
+				// 5,sn,6,maxSN...head,readSN,3
+				if c.readHead == nil {
+					c.readHead = c.newReadData(sn, data, c.readHead)
+				} else {
+					p := c.readHead
+					// 先循环到溢出到部分
+					for p.next != nil {
+						if p.next.sn < p.sn {
+							p = p.next
+							break
+						}
+					}
+					// 再添加到溢出到部分
 					if sn == p.sn {
 						return false
 					}
-					if sn >= c.readSN && sn < p.sn {
-						break
-					} else if p.sn <= maxSN && sn < p.sn {
-						break
+					for p.next != nil {
+						if sn == p.next.sn {
+							return false
+						}
+						if sn < p.next.sn {
+							break
+						}
+						p = p.next
 					}
-					n = p
-					p = p.next
+					p.next = c.newReadData(sn, data, p.next)
 				}
-				n.next = c.newReadData(sn, data, p)
+			}
+		} else {
+			// head,readSN,3,4,sn,5,6,maxSN...
+			if sn < c.readSN || sn > maxSN {
+				return false
 			}
 		}
 	} else {
+		// head,readSN,3,4,sn,5,6,maxSN...
 		if sn < c.readSN || sn > maxSN {
 			return false
 		}
-		if c.readHead == nil {
-			c.readHead = c.newReadData(sn, data, nil)
+	}
+	if c.readHead == nil {
+		c.readHead = c.newReadData(sn, data, c.readHead)
+	} else {
+		p := c.readHead
+		if sn == p.sn {
+			return false
+		}
+		if sn < p.sn {
+			c.readHead = c.newReadData(sn, data, p)
 		} else {
-			p := c.readHead
-			if sn == p.sn {
-				return false
-			}
-			if sn < p.sn {
-				c.readHead = c.newReadData(sn, data, p)
-			} else {
-				n := p
-				p = p.next
-				for p != nil {
-					if sn == p.sn {
-						return false
-					}
-					if sn < p.sn {
-						break
-					}
-					n = p
-					p = p.next
+			for p.next != nil {
+				if sn == p.next.sn {
+					return false
 				}
-				n.next = c.newReadData(sn, data, p)
+				if sn < p.next.sn {
+					break
+				}
+				p = p.next
 			}
+			p.next = c.newReadData(sn, data, p.next)
 		}
 	}
 	// 检查连续的sn
-	p := c.readHead
-	for p != nil && p.sn == c.readSN {
+	for c.readHead != nil && c.readHead.sn == c.readSN {
+		if c.readDataHead == nil {
+			c.readDataHead = c.readHead
+			c.readDataTail = c.readDataHead
+		} else {
+			c.readDataTail.next = c.readHead
+			c.readDataTail = c.readDataTail.next
+		}
+		c.readHead = c.readHead.next
 		c.readSN++
 		if c.readSN > maxDataSN {
 			c.readSN = 0
 		}
-		p = p.next
 	}
 	return true
 }
@@ -560,7 +611,7 @@ func (c *Conn) addWriteData(data []byte) int {
 		n += m
 		data = data[m:]
 	} else {
-		// 检查最后一个数据包是否"满数据"，有可以写的空间，没有被发送过
+		// 检查最后一个数据包是否"满数据"，有可以写的空间，而且没有被发送过
 		if c.writeTail.len < c.writeMSS && c.writeTail.first.IsZero() {
 			m = copy(c.writeTail.buff[c.writeTail.len:c.writeMSS], data)
 			c.writeTail.len += uint16(m)
@@ -581,33 +632,29 @@ func (c *Conn) addWriteData(data []byte) int {
 	return n
 }
 
-// 移除第一个数据块
-func (c *Conn) removeReadDataFront() {
-	d := c.readHead
-	c.readHead = c.readHead.next
-	c.readLen--
-	readDataPool.Put(d)
-}
-
 // 移除发送队列小于sn的数据包
-func (c *Conn) removeWriteDataBefore(p *writeData, sn uint32) *writeData {
-	for p != nil {
-		if sn < p.sn {
+func (c *Conn) removeWriteDataBefore(sn uint32) {
+	for c.writeHead != nil {
+		if sn < c.writeHead.sn {
 			break
 		}
-		if sn == p.sn {
-			c.calculateRTO(time.Until(p.first))
+		if sn == c.writeHead.sn {
+			c.calculateRTO(time.Until(c.writeHead.first))
+			n := c.writeHead
+			c.writeHead = c.writeHead.next
+			writeDataPool.Put(n)
+			c.writeLen--
+			break
 		}
-		n := p
-		p = p.next
+		n := c.writeHead
+		c.writeHead = c.writeHead.next
 		writeDataPool.Put(n)
 		c.writeLen--
 	}
-	return p
 }
 
 // 移除发送队列指定sn的数据包
-func (c *Conn) removeWriteDataAt(sn uint32) bool {
+func (c *Conn) removeWriteDataAt(sn uint32) {
 	p := c.writeHead
 	// 第一个
 	if sn == p.sn {
@@ -615,16 +662,16 @@ func (c *Conn) removeWriteDataAt(sn uint32) bool {
 		c.writeHead = p.next
 		writeDataPool.Put(p)
 		c.writeLen--
-		if p.next == nil {
-			c.writeTail = p
+		if c.writeHead == nil {
+			c.writeTail = nil
 		}
-		return true
+		return
 	}
 	// 剩下的
 	n := p.next
 	for n != nil {
 		if sn < n.sn {
-			return false
+			return
 		}
 		if sn == n.sn {
 			c.calculateRTO(time.Until(n.first))
@@ -634,12 +681,11 @@ func (c *Conn) removeWriteDataAt(sn uint32) bool {
 			if p.next == nil {
 				c.writeTail = p
 			}
-			return true
+			return
 		}
 		p = n
 		n = n.next
 	}
-	return false
 }
 
 // 移除发送队列的数据包
@@ -649,131 +695,98 @@ func (c *Conn) removeWriteData(sn, maxSN uint32) bool {
 		return false
 	}
 	if c.writeHead.sn <= c.writeTail.sn {
-		// sn没溢出，...3,4,5,6,7,8...
-		if sn < c.writeHead.sn || sn > c.writeTail.sn || maxSN < c.writeHead.sn || maxSN > c.writeTail.sn {
+		// head...3,4,5,6,7,8...tail
+		if sn < c.writeHead.sn || sn > c.writeTail.sn {
 			return false
 		}
 		// 原来的数量
 		writeLen := c.writeLen
 		// 移除小于maxSN
-		c.writeHead = c.removeWriteDataBefore(c.writeHead, maxSN)
+		if maxSN >= c.writeHead.sn && maxSN <= c.writeTail.sn {
+			c.removeWriteDataBefore(maxSN)
+		}
 		if c.writeHead == nil {
 			c.writeTail = nil
 			return writeLen != c.writeLen
 		}
-		// 移除sn，下面两种情况
-		// ...3,4,sn,5,6,maxSN,7,8...，已
-		// ...3,4,5,maxSN,6,7,sn,8...，未
-		if c.writeHead != nil && sn > maxSN && c.removeWriteDataAt(sn) {
-			return true
+		// 移除sn
+		// head...3,sn,5,maxSN,6,8...tail
+		// head...3,4,maxSN,7,sn,8...tail
+		if sn > maxSN {
+			c.removeWriteDataAt(sn)
 		}
 		return writeLen != c.writeLen
 	} else {
-		// sn溢出，5,6,7,8,9...2,3,4
-		if (sn < c.writeHead.sn && sn > c.writeTail.sn) || (maxSN < c.writeHead.sn && maxSN > c.writeTail.sn) {
+		// 0,2,3...tail head...4,6
+		if sn < c.writeHead.sn && sn > c.writeTail.sn {
 			return false
 		}
 		// 原来的数量
 		writeLen := c.writeLen
 		// 移除小于maxSN的数据
 		if maxSN <= c.writeTail.sn {
-			// 5,6,7,maxSN,9...2,3,4
-			p := c.writeHead
-			// 先移除...2,3,4
-			for p != nil {
-				if p.sn < c.writeTail.sn {
-					break
-				}
-				n := p
-				p = p.next
-				writeDataPool.Put(n)
-				c.writeLen--
-			}
-			// 移除5,6,7,maxSN,...
-			c.writeHead = c.removeWriteDataBefore(p, maxSN)
+			// 0,2,maxSN,3...tail head...4,6
+			c.removeWriteDataBefore(maxDataSN)
 			if c.writeHead == nil {
 				c.writeTail = nil
 				return writeLen != c.writeLen
 			}
-			// 移除sn，下面三种情况
-			// 5,6,7,maxSN,9...2,3,sn,4，已
-			// 5,sn,6,7,maxSN,9...2,3,4，已
-			// 5,6,maxSN,7,sn,9...2,3,4，未
-			if c.writeHead != nil && sn < c.writeTail.sn && sn > maxSN && c.removeWriteDataAt(sn) {
-				return true
+			c.removeWriteDataBefore(maxSN)
+			if c.writeHead == nil {
+				c.writeTail = nil
+				return writeLen != c.writeLen
+			}
+			// 移除sn
+			// 0,2,maxSN,3...tail head...4,sn,6
+			// 0,sn,2,maxSN,3...tail head...4,6
+			// 0,2,maxSN,sn,3...tail head...4,6
+			if sn < c.writeTail.sn && sn > maxSN {
+				c.removeWriteDataAt(sn)
 			}
 		} else {
-			// 5,6,7,9...2,3,maxSN,4
-			c.writeHead = c.removeWriteDataBefore(c.writeHead, maxSN)
+			// 0,2,3...tail head...4,maxSN,6
+			c.removeWriteDataBefore(maxSN)
 			if c.writeHead == nil {
 				c.writeTail = nil
 				return writeLen != c.writeLen
 			}
-			// 移除sn，下面三种情况
-			// 5,6,7,9...2,sn,3,maxSN,4，已
-			// 5,6,7,9...2,3,maxSN,sn,4，未
-			// 5,6,sn,7,9...2,3,maxSN,4，未
-			if c.writeHead != nil {
-				if sn >= c.writeHead.sn {
-					// 5,6,7,9...2,3,maxSN,sn,4，未
-					if sn > maxSN && c.removeWriteDataAt(sn) {
-						return true
+			// 移除sn
+			if sn >= c.writeHead.sn {
+				// 0,2,3...tail head...4,sn,maxSN,6
+				// 0,2,3...tail head...4,maxSN,sn,6
+				if sn > maxSN {
+					c.removeWriteDataAt(sn)
+				}
+			} else {
+				// 0,2,sn,3...tail head...4,maxSN,6
+				p := c.writeHead
+				// head...4,maxSN,6
+				for {
+					if p.next == nil {
+						return writeLen != c.writeLen
 					}
-				} else {
-					// 5,6,sn,7,9...2,3,maxSN,4，未
-					p := c.writeHead
-					if p.sn <= c.writeTail.sn {
-						if sn == p.sn {
-							c.calculateRTO(time.Until(p.first))
-							c.writeHead = p.next
-							writeDataPool.Put(p)
-							c.writeLen--
-							if p.next == nil {
-								c.writeTail = p
-							}
-							return true
-						}
-					} else {
-						// 遍历末尾到溢出的开始
+					if p.next.sn <= c.writeTail.sn {
+						break
+					}
+					p = p.next
+				}
+				// 0,2,sn,3...tail
+				for p.next != nil {
+					if sn < p.next.sn {
+						return writeLen != c.writeLen
+					}
+					if sn == p.next.sn {
+						c.calculateRTO(time.Until(p.next.first))
 						n := p.next
-						for n != nil {
-							if n.sn < c.writeTail.sn {
-								break
-							}
-							p = n
-							n = n.next
+						p.next = n.next
+						writeDataPool.Put(n)
+						c.writeLen--
+						if p.next == nil {
+							c.writeTail = p
 						}
-						if sn == n.sn {
-							c.calculateRTO(time.Until(n.first))
-							p.next = n.next
-							writeDataPool.Put(n)
-							c.writeLen--
-							if p.next == nil {
-								c.writeTail = p
-							}
-							return true
-						}
-						p = n
+						break
 					}
-					// 剩下的
-					n := p.next
-					for n != nil {
-						if sn < n.sn {
-							return false
-						}
-						if sn == n.sn {
-							c.calculateRTO(time.Until(n.first))
-							p.next = n.next
-							writeDataPool.Put(n)
-							c.writeLen--
-							if p.next == nil {
-								c.writeTail = p
-							}
-							return true
-						}
-						p = n
-						n = n.next
-					}
+					p = p.next
 				}
 			}
 		}
@@ -787,7 +800,7 @@ func (c *Conn) checkRTO(now time.Time, rudp *RUDP) {
 	n := c.writeLen
 	// 没有数据
 	if n < 1 {
-		if c.state&closedState != 0 {
+		if c.state&shutdownState != 0 {
 			// 应用层关闭连接，发送closeSegment
 			rudp.WriteToConn(c.buff[:closeSegmentLength], c)
 		}
@@ -858,9 +871,9 @@ func (c *Conn) decConnectSegment(seg *segment) {
 	c.remoteListenAddr.Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentLocalPort:]))
 	copy(c.localInternetAddr.IP, seg.b[connectSegmentRemoteIP:])
 	c.localInternetAddr.Port = int(binary.BigEndian.Uint16(seg.b[connectSegmentRemotePort:]))
-	c.writeMSS = binary.BigEndian.Uint16(seg.b[connectSegmentMSS:])
-	if c.writeMSS == 0 {
-		c.writeMSS = minMSS
+	c.remoteWriteMSS = binary.BigEndian.Uint16(seg.b[connectSegmentMSS:])
+	if c.remoteWriteMSS == 0 {
+		c.remoteWriteMSS = minMSS
 	}
 	c.remoteReadLen = binary.BigEndian.Uint16(seg.b[connectSegmentReadQueue:])
 }
@@ -869,7 +882,11 @@ func (c *Conn) encAckSegment(seg *segment, sn uint32) {
 	seg.b[segmentType] = ackSegment | c.from
 	binary.BigEndian.PutUint32(seg.b[segmentToken:], c.token)
 	putUint24(seg.b[ackSegmentDataSN:], sn)
-	putUint24(seg.b[ackSegmentDataMaxSN:], c.readSN-1)
+	if c.readSN == 0 {
+		putUint24(seg.b[ackSegmentDataMaxSN:], maxDataSN)
+	} else {
+		putUint24(seg.b[ackSegmentDataMaxSN:], c.readSN-1)
+	}
 	binary.BigEndian.PutUint16(seg.b[ackSegmentReadQueueLength:], c.readCap-c.readLen)
 	binary.BigEndian.PutUint64(seg.b[ackSegmentTimestamp:], c.writeAckSN)
 	c.writeAckSN++
