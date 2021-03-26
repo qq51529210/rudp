@@ -57,16 +57,17 @@ func (e timeoutError) Timeout() bool { return true }
 
 // readQueue的数据块
 type readData struct {
-	sn   uint32    // 序号，24位
-	data []byte    // 数据
-	idx  uint16    // 有效数据的起始，因为read有可能一次读不完数据
-	next *readData // 下一个
+	sn   uint32       // 序号，24位
+	buf  [maxMSS]byte // 数据
+	idx  uint16       // 有效数据的起始，因为read有可能一次读不完数据
+	len  uint16       // 数据大小
+	next *readData    // 下一个
 }
 
 // writeQueue的数据块
 type writeData struct {
 	sn    uint32        // 序号，24位
-	buff  []byte        // 数据
+	buf   [maxMSS]byte  // 数据
 	len   uint16        // 数据大小，因为write有可能写不完数据块
 	next  *writeData    // 下一个
 	first time.Time     // 第一次被发送的时间，用于计算rto
@@ -199,7 +200,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 				return 0, c.netOpError("write", errConnClosed)
 			}
 			c.writeLock.Lock()
-			n = c.addWriteData(b[m:])
+			n = c.write(b[m:])
 			c.writeLock.Unlock()
 			if n == 0 {
 				select {
@@ -228,7 +229,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 			return 0, c.netOpError("write", errConnClosed)
 		}
 		c.writeLock.Lock()
-		n = c.addWriteData(b[m:])
+		n = c.write(b[m:])
 		c.writeLock.Unlock()
 		if n == 0 {
 			select {
@@ -391,13 +392,34 @@ func (c *Conn) netOpError(op string, err error) error {
 	}
 }
 
+// 计算rto
+func (c *Conn) calculateRTO(rtt time.Duration) {
+	c.avrRTO = (3*c.avrRTO + c.rtt - rtt) / 4
+	c.rtt = (7*c.rtt + rtt) / 8
+	c.rto = c.rtt + 4*c.avrRTO
+	if c.minRTO != 0 && c.rto < c.minRTO {
+		c.rto = c.minRTO
+	}
+	if c.maxRTO != 0 && c.rto > c.maxRTO {
+		c.rto = c.maxRTO
+	}
+}
+
+// 初始化rto
+func (c *Conn) initRTO(rtt time.Duration) {
+	c.rtt = rtt
+	c.rto = rtt / 2
+	c.avrRTO = c.rto
+	c.minRTO = connMinRTO
+	c.maxRTO = connMaxRTO
+}
+
 // 返回一个*readData
 func (c *Conn) newReadData(sn uint32, data []byte, next *readData) *readData {
 	d := readDataPool.Get().(*readData)
-	d.sn = sn
 	d.idx = 0
-	d.data = d.data[:]
-	d.data = append(d.data, data...)
+	d.sn = sn
+	d.len = uint16(copy(d.buf[0:], data))
 	d.next = next
 	c.readLen++
 	return d
@@ -414,36 +436,12 @@ func (c *Conn) newWriteData() *writeData {
 	}
 	d.next = nil
 	d.first = time.Time{}
-	if cap(d.buff) < int(c.writeMSS) {
-		d.buff = make([]byte, c.writeMSS)
-	}
-	d.buff[segmentType] = c.from | dataSegment
-	binary.BigEndian.PutUint32(d.buff[segmentToken:], c.token)
-	putUint24(d.buff[dataSegmentSN:], d.sn)
+	d.buf[segmentType] = c.from | dataSegment
+	binary.BigEndian.PutUint32(d.buf[segmentToken:], c.token)
+	putUint24(d.buf[dataSegmentSN:], d.sn)
 	d.len = dataSegmentPayload
 	c.writeLen++
 	return d
-}
-
-// 计算rto
-func (c *Conn) calculateRTO(rtt time.Duration) {
-	c.avrRTO = (3*c.avrRTO + c.rtt - rtt) / 4
-	c.rtt = (7*c.rtt + rtt) / 8
-	c.rto = c.rtt + 4*c.avrRTO
-	if c.minRTO != 0 && c.rto < c.minRTO {
-		c.rto = c.minRTO
-	}
-	if c.maxRTO != 0 && c.rto > c.maxRTO {
-		c.rto = c.maxRTO
-	}
-}
-
-func (c *Conn) initRTO(rtt time.Duration) {
-	c.rtt = rtt
-	c.rto = rtt / 2
-	c.avrRTO = c.rto
-	c.minRTO = connMinRTO
-	c.maxRTO = connMaxRTO
 }
 
 // 读取连续的数据，返回0表示没有数据，返回-1表示io.EOF
@@ -454,18 +452,18 @@ func (c *Conn) read(b []byte) int {
 	n, m := 0, 0
 	for {
 		// 拷贝数据到buf
-		m = copy(b[n:], c.readDataHead.data[c.readDataHead.idx:])
+		m = copy(b[n:], c.readDataHead.buf[c.readDataHead.idx:c.readDataHead.len])
 		n += m
 		c.readDataHead.idx += uint16(m)
 		// 数据块数据拷贝完了，移除
-		if int(c.readDataHead.idx) >= len(c.readDataHead.data) {
+		if c.readDataHead.idx >= c.readDataHead.len {
 			d := c.readDataHead
 			c.readDataHead = c.readDataHead.next
 			readDataPool.Put(d)
+			c.readLen--
 		}
 		// 没有数据，或者buf满了
 		if c.readDataHead == nil {
-			c.readDataTail = nil
 			return n
 		}
 		if n == len(b) {
@@ -487,6 +485,9 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 			c.readDataTail = c.readDataTail.next
 		}
 		c.readSN++
+		if c.readSN > maxDataSN {
+			c.readSN = 0
+		}
 		// 检查接收队列的sn，是否与readSN接上
 		for c.readHead != nil && c.readHead.sn == c.readSN {
 			// 添加到可读队列
@@ -503,66 +504,55 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 	// 是否在接收范围
 	maxSN := c.readSN + uint32(c.readCap)
 	if maxSN > maxDataSN {
-		// 4,5,6,maxSN...head,1,2,3
+		// readSN...head...maxDataSN...maxSN
 		maxSN -= maxDataSN
-		if c.readSN > maxSN {
-			// 4,5,6,maxSN...head,readSN,3
-			if sn > maxSN {
-				// 4,5,6,maxSN...head,readSN,sn,3
-				if sn < c.readSN {
-					return false
-				}
-			} else {
-				// 5,sn,6,maxSN...head,readSN,3
-				if c.readHead == nil {
-					c.readHead = c.newReadData(sn, data, c.readHead)
-				} else {
-					p := c.readHead
-					// 先循环到溢出到部分
-					for p.next != nil {
-						if p.next.sn < p.sn {
-							p = p.next
-							break
-						}
-					}
-					// 再添加到溢出到部分
-					if sn == p.sn {
-						return false
-					}
-					for p.next != nil {
-						if sn == p.next.sn {
-							return false
-						}
-						if sn < p.next.sn {
-							break
-						}
-						p = p.next
-					}
-					p.next = c.newReadData(sn, data, p.next)
-				}
-			}
-		} else {
-			// head,readSN,3,4,sn,5,6,maxSN...
-			if sn < c.readSN || sn > maxSN {
+		// ...maxSN readSN...head...maxDataSN
+		if sn > maxSN {
+			// ...maxSN readSN...sn...head...maxDataSN
+			if sn < c.readSN {
 				return false
 			}
+		} else {
+			// ...sn...maxSN readSN...head...maxDataSN
+			if c.readHead == nil {
+				c.readHead = c.newReadData(sn, data, nil)
+			} else {
+				p := c.readHead
+				// readSN...head...maxDataSN
+				for p.next != nil && p.next.sn > p.sn {
+					p = p.next
+				}
+				// ...sn...maxSN
+				for p.next != nil {
+					if sn == p.next.sn {
+						return false
+					}
+					if sn < p.next.sn {
+						break
+					}
+					p = p.next
+				}
+				p.next = c.newReadData(sn, data, p.next)
+			}
+			return true
 		}
 	} else {
-		// head,readSN,3,4,sn,5,6,maxSN...
+		// readSN...head...sn...maxSN
 		if sn < c.readSN || sn > maxSN {
 			return false
 		}
 	}
+	// readSN...head...sn...maxSN
 	if c.readHead == nil {
-		c.readHead = c.newReadData(sn, data, c.readHead)
+		c.readHead = c.newReadData(sn, data, nil)
 	} else {
-		p := c.readHead
-		if sn == p.sn {
+		if sn == c.readHead.sn {
 			return false
 		}
-		if sn < p.sn {
-			c.readHead = c.newReadData(sn, data, p)
+		if sn < c.readHead.sn {
+			c.readHead = c.newReadData(sn, data, c.readHead)
 		} else {
+			p := c.readHead
 			for p.next != nil {
 				if sn == p.next.sn {
 					return false
@@ -575,26 +565,11 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 			p.next = c.newReadData(sn, data, p.next)
 		}
 	}
-	// 检查连续的sn
-	for c.readHead != nil && c.readHead.sn == c.readSN {
-		if c.readDataHead == nil {
-			c.readDataHead = c.readHead
-			c.readDataTail = c.readDataHead
-		} else {
-			c.readDataTail.next = c.readHead
-			c.readDataTail = c.readDataTail.next
-		}
-		c.readHead = c.readHead.next
-		c.readSN++
-		if c.readSN > maxDataSN {
-			c.readSN = 0
-		}
-	}
 	return true
 }
 
 // 写入数据，返回0表示队列满了无法写入
-func (c *Conn) addWriteData(data []byte) int {
+func (c *Conn) write(data []byte) int {
 	// 还能添加多少个数据包
 	maxAdd := c.writeCap - c.writeLen
 	if maxAdd <= 0 {
@@ -605,15 +580,15 @@ func (c *Conn) addWriteData(data []byte) int {
 		// 队列中没有数据
 		c.writeHead = c.newWriteData()
 		c.writeTail = c.writeHead
-		m = copy(c.writeTail.buff[c.writeTail.len:c.writeMSS], data)
+		m = copy(c.writeTail.buf[c.writeTail.len:c.writeMSS], data)
 		c.writeTail.len += uint16(m)
-		maxAdd--
 		n += m
 		data = data[m:]
+		maxAdd--
 	} else {
 		// 检查最后一个数据包是否"满数据"，有可以写的空间，而且没有被发送过
 		if c.writeTail.len < c.writeMSS && c.writeTail.first.IsZero() {
-			m = copy(c.writeTail.buff[c.writeTail.len:c.writeMSS], data)
+			m = copy(c.writeTail.buf[c.writeTail.len:c.writeMSS], data)
 			c.writeTail.len += uint16(m)
 			n += m
 			data = data[m:]
@@ -623,58 +598,51 @@ func (c *Conn) addWriteData(data []byte) int {
 	for maxAdd > 0 && len(data) > 0 {
 		c.writeTail.next = c.newWriteData()
 		c.writeTail = c.writeTail.next
-		m = copy(c.writeTail.buff[c.writeTail.len:c.writeMSS], data)
+		m = copy(c.writeTail.buf[c.writeTail.len:c.writeMSS], data)
 		c.writeTail.len += uint16(m)
-		maxAdd--
 		n += m
 		data = data[m:]
+		maxAdd--
 	}
 	return n
 }
 
 // 移除发送队列小于sn的数据包
-func (c *Conn) removeWriteDataBefore(sn uint32) {
-	for c.writeHead != nil {
-		if sn < c.writeHead.sn {
-			break
-		}
-		if sn == c.writeHead.sn {
-			c.calculateRTO(time.Until(c.writeHead.first))
-			n := c.writeHead
-			c.writeHead = c.writeHead.next
-			writeDataPool.Put(n)
-			c.writeLen--
-			break
+func (c *Conn) removeWriteDataBefore(maxSN uint32) {
+	for {
+		if c.writeHead.sn > maxSN {
+			return
 		}
 		n := c.writeHead
 		c.writeHead = c.writeHead.next
 		writeDataPool.Put(n)
 		c.writeLen--
+		if c.writeHead == nil {
+			return
+		}
 	}
 }
 
 // 移除发送队列指定sn的数据包
 func (c *Conn) removeWriteDataAt(sn uint32) {
-	p := c.writeHead
 	// 第一个
-	if sn == p.sn {
-		c.calculateRTO(time.Until(p.first))
-		c.writeHead = p.next
-		writeDataPool.Put(p)
+	if sn == c.writeHead.sn {
+		c.calculateRTO(time.Until(c.writeHead.first))
+		n := c.writeHead
+		c.writeHead = c.writeHead.next
+		writeDataPool.Put(n)
 		c.writeLen--
-		if c.writeHead == nil {
-			c.writeTail = nil
-		}
 		return
 	}
 	// 剩下的
-	n := p.next
-	for n != nil {
-		if sn < n.sn {
+	p := c.writeHead
+	for p.next != nil {
+		if sn < p.next.sn {
 			return
 		}
-		if sn == n.sn {
-			c.calculateRTO(time.Until(n.first))
+		if sn == p.next.sn {
+			c.calculateRTO(time.Until(p.next.first))
+			n := p.next
 			p.next = n.next
 			writeDataPool.Put(n)
 			c.writeLen--
@@ -683,8 +651,7 @@ func (c *Conn) removeWriteDataAt(sn uint32) {
 			}
 			return
 		}
-		p = n
-		n = n.next
+		p = p.next
 	}
 }
 
@@ -695,102 +662,106 @@ func (c *Conn) removeWriteData(sn, maxSN uint32) bool {
 		return false
 	}
 	if c.writeHead.sn <= c.writeTail.sn {
-		// head...3,4,5,6,7,8...tail
+		// head...sn...tail
 		if sn < c.writeHead.sn || sn > c.writeTail.sn {
 			return false
 		}
-		// 原来的数量
 		writeLen := c.writeLen
-		// 移除小于maxSN
+		// head...maxSN...tail
 		if maxSN >= c.writeHead.sn && maxSN <= c.writeTail.sn {
 			c.removeWriteDataBefore(maxSN)
 		}
-		if c.writeHead == nil {
-			c.writeTail = nil
-			return writeLen != c.writeLen
-		}
-		// 移除sn
-		// head...3,sn,5,maxSN,6,8...tail
-		// head...3,4,maxSN,7,sn,8...tail
-		if sn > maxSN {
+		// head...maxSN...sn...tail
+		if sn > maxSN && c.writeHead != nil {
 			c.removeWriteDataAt(sn)
 		}
 		return writeLen != c.writeLen
 	} else {
-		// 0,2,3...tail head...4,6
+		// ...tail head...maxDataSN
 		if sn < c.writeHead.sn && sn > c.writeTail.sn {
 			return false
 		}
-		// 原来的数量
 		writeLen := c.writeLen
-		// 移除小于maxSN的数据
 		if maxSN <= c.writeTail.sn {
-			// 0,2,maxSN,3...tail head...4,6
-			c.removeWriteDataBefore(maxDataSN)
-			if c.writeHead == nil {
-				c.writeTail = nil
-				return writeLen != c.writeLen
-			}
-			c.removeWriteDataBefore(maxSN)
-			if c.writeHead == nil {
-				c.writeTail = nil
-				return writeLen != c.writeLen
-			}
-			// 移除sn
-			// 0,2,maxSN,3...tail head...4,sn,6
-			// 0,sn,2,maxSN,3...tail head...4,6
-			// 0,2,maxSN,sn,3...tail head...4,6
-			if sn < c.writeTail.sn && sn > maxSN {
-				c.removeWriteDataAt(sn)
-			}
-		} else {
-			// 0,2,3...tail head...4,maxSN,6
-			c.removeWriteDataBefore(maxSN)
-			if c.writeHead == nil {
-				c.writeTail = nil
-				return writeLen != c.writeLen
-			}
-			// 移除sn
-			if sn >= c.writeHead.sn {
-				// 0,2,3...tail head...4,sn,maxSN,6
-				// 0,2,3...tail head...4,maxSN,sn,6
-				if sn > maxSN {
+			// ...maxSN...tail head...maxDataSN
+			if c.writeHead.next != nil {
+				p := c.writeHead
+				// head...maxDataSN
+				for {
+					if p.next.sn < p.sn {
+						break
+					}
+					n := p.next
+					p.next = p.next.next
+					writeDataPool.Put(n)
+					c.writeLen--
+				}
+				// head...maxSN...tail
+				if maxSN >= c.writeHead.sn && maxSN <= c.writeTail.sn {
+					c.removeWriteDataBefore(maxSN)
+				}
+				// ...maxSN...sn...tail head...maxDataSN
+				if sn > maxSN && sn < c.writeTail.sn && c.writeHead != nil {
 					c.removeWriteDataAt(sn)
 				}
-			} else {
-				// 0,2,sn,3...tail head...4,maxSN,6
-				p := c.writeHead
-				// head...4,maxSN,6
-				for {
-					if p.next == nil {
-						return writeLen != c.writeLen
+			}
+		} else {
+			// ...tail head...maxSN...maxDataSN
+			c.removeWriteDataBefore(maxSN)
+			if c.writeHead != nil {
+				if sn >= c.writeHead.sn {
+					// ...tail head...maxSN...sn...maxDataSN
+					if sn > maxSN {
+						c.removeWriteDataAt(sn)
 					}
-					if p.next.sn <= c.writeTail.sn {
-						break
-					}
-					p = p.next
-				}
-				// 0,2,sn,3...tail
-				for p.next != nil {
-					if sn < p.next.sn {
-						return writeLen != c.writeLen
-					}
-					if sn == p.next.sn {
-						c.calculateRTO(time.Until(p.next.first))
-						n := p.next
-						p.next = n.next
-						writeDataPool.Put(n)
-						c.writeLen--
-						if p.next == nil {
-							c.writeTail = p
+				} else {
+					// ...sn...tail head...maxSN...maxDataSN
+					p := c.writeHead
+					// p...sn...tail
+					for p.next != nil {
+						if p.next.sn < p.sn {
+							break
 						}
-						break
+						p = p.next
 					}
-					p = p.next
+					for p.next != nil {
+						if sn < p.next.sn {
+							return writeLen != c.writeLen
+						}
+						if sn == p.next.sn {
+							c.calculateRTO(time.Until(p.next.first))
+							n := p.next
+							p.next = n.next
+							writeDataPool.Put(n)
+							c.writeLen--
+							if p.next == nil {
+								c.writeTail = p
+							}
+							break
+						}
+						p = p.next
+					}
 				}
 			}
 		}
 		return writeLen != c.writeLen
+	}
+}
+func (c *Conn) releaseReadData() {
+	p := c.readHead
+	for p != nil {
+		d := p
+		p = p.next
+		readDataPool.Put(d)
+	}
+}
+
+func (c *Conn) releaseWriteData() {
+	p := c.writeHead
+	for p != nil {
+		d := p
+		p = p.next
+		writeDataPool.Put(d)
 	}
 }
 
@@ -813,16 +784,16 @@ func (c *Conn) checkRTO(now time.Time, rudp *RUDP) {
 	// 开始遍历发送队列
 	p := c.writeHead
 	for p != nil && n > 0 {
-		// 第一次发送
 		if p.first.IsZero() {
+			// 第一次发送
 			p.first = now
-			rudp.WriteToConn(p.buff[:p.len], c)
+			rudp.WriteToConn(p.buf[:p.len], c)
 			p.last = now
 			n--
 		} else {
 			// 超时重传
 			if now.Sub(p.last) >= p.rto {
-				rudp.WriteToConn(p.buff[:p.len], c)
+				rudp.WriteToConn(p.buf[:p.len], c)
 				p.last = now
 				p.rto += c.rto
 				if p.rto > c.maxRTO {
@@ -832,24 +803,6 @@ func (c *Conn) checkRTO(now time.Time, rudp *RUDP) {
 			}
 		}
 		p = p.next
-	}
-}
-
-func (c *Conn) releaseReadData() {
-	p := c.readHead
-	for p != nil {
-		d := p
-		p = p.next
-		readDataPool.Put(d)
-	}
-}
-
-func (c *Conn) releaseWriteData() {
-	p := c.writeHead
-	for p != nil {
-		d := p
-		p = p.next
-		writeDataPool.Put(d)
 	}
 }
 

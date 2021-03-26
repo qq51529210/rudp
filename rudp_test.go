@@ -19,6 +19,8 @@ func Test_RUDP(t *testing.T) {
 	go tr.ServerRoutine()
 	go tr.ClientRoutine(20)
 	tr.Wait()
+	tr.server.Close()
+	tr.client.Close()
 	//
 	if tr.serverError != nil {
 		t.Fatal(tr.serverError)
@@ -26,6 +28,7 @@ func Test_RUDP(t *testing.T) {
 	if tr.clientError != nil {
 		t.Fatal(tr.clientError)
 	}
+	t.Log(tr.serverBytes, tr.clientBytes)
 	// 比较传输的数据哈希值
 	if !bytes.Equal(tr.clientHash.Sum(nil), tr.serverHash.Sum(nil)) {
 		t.FailNow()

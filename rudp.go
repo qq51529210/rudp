@@ -594,6 +594,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					select {
 					case conn.readSignle <- 1:
 					default:
+						fmt.Println(seg.a, "123")
 					}
 				}
 			case ackSegment:
