@@ -3,6 +3,7 @@ package rudp
 import (
 	"bytes"
 	"crypto/md5"
+	"fmt"
 	"hash"
 	"io"
 	"sync"
@@ -107,6 +108,9 @@ func (tr *testRUDP) ClientRoutine(multiple int) {
 		if err != nil {
 			tr.clientError = err
 			return
+		}
+		if n != len(buff) {
+			fmt.Println(n)
 		}
 		tr.clientBytes += n
 		tr.clientHash.Write(buff[:n])

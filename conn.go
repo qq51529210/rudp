@@ -2,6 +2,7 @@ package rudp
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -212,7 +213,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 			}
 			m += n
 			if m == len(b) {
-				return n, nil
+				return m, nil
 			}
 		}
 	}
@@ -243,7 +244,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		}
 		m += n
 		if m == len(b) {
-			return n, nil
+			return m, nil
 		}
 	}
 }
@@ -457,6 +458,7 @@ func (c *Conn) read(b []byte) int {
 		c.readDataHead.idx += uint16(m)
 		// 数据块数据拷贝完了，移除
 		if c.readDataHead.idx >= c.readDataHead.len {
+			fmt.Println("read sn", c.readDataHead.sn, "len", c.readDataHead.len, "readSN", c.readSN, "readLen", c.readLen)
 			d := c.readDataHead
 			c.readDataHead = c.readDataHead.next
 			readDataPool.Put(d)
@@ -492,6 +494,7 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 		for c.readHead != nil && c.readHead.sn == c.readSN {
 			// 添加到可读队列
 			c.readDataTail.next = c.readHead
+			c.readDataTail = c.readDataTail.next
 			// 下一个
 			c.readHead = c.readHead.next
 			c.readSN++
@@ -522,7 +525,7 @@ func (c *Conn) addReadData(sn uint32, data []byte) bool {
 				for p.next != nil && p.next.sn > p.sn {
 					p = p.next
 				}
-				// ...sn...maxSN
+				// p...sn...maxSN
 				for p.next != nil {
 					if sn == p.next.sn {
 						return false
@@ -747,6 +750,8 @@ func (c *Conn) removeWriteData(sn, maxSN uint32) bool {
 		return writeLen != c.writeLen
 	}
 }
+
+// 回收接收队列的内存
 func (c *Conn) releaseReadData() {
 	p := c.readHead
 	for p != nil {
@@ -754,8 +759,15 @@ func (c *Conn) releaseReadData() {
 		p = p.next
 		readDataPool.Put(d)
 	}
+	p = c.readDataHead
+	for p != nil {
+		d := p
+		p = p.next
+		readDataPool.Put(d)
+	}
 }
 
+// 回收发送队列的内存
 func (c *Conn) releaseWriteData() {
 	p := c.writeHead
 	for p != nil {
