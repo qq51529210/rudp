@@ -2,7 +2,6 @@ package rudp
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -28,7 +27,7 @@ var (
 	connWriteQueue  = uint16(128)             // 默认的conn的发送队列长度
 	connReadQueue   = uint16(128)             // 默认的conn的接收队列长度
 	connHandleQueue = uint16(256)             // 默认的conn的处理队列长度
-	connMinRTO      = 100 * time.Millisecond  // 最小超时重传，毫秒
+	connMinRTO      = 10 * time.Millisecond   // 最小超时重传，毫秒
 	connMaxRTO      = 1000 * time.Millisecond // 最大超时重传，毫秒
 )
 
@@ -458,7 +457,7 @@ func (c *Conn) read(b []byte) int {
 		c.readDataHead.idx += uint16(m)
 		// 数据块数据拷贝完了，移除
 		if c.readDataHead.idx >= c.readDataHead.len {
-			fmt.Println("read sn", c.readDataHead.sn, "len", c.readDataHead.len, "readSN", c.readSN, "readLen", c.readLen)
+			// fmt.Println("read sn", c.readDataHead.sn, "len", c.readDataHead.len, "readSN", c.readSN, "readLen", c.readLen)
 			d := c.readDataHead
 			c.readDataHead = c.readDataHead.next
 			readDataPool.Put(d)

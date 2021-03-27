@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"net"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 )
@@ -590,20 +589,20 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				// 响应ackSegment
 				r.WriteToConn(seg.b[:ackSegmentLength], conn)
 				if ok {
-					var str strings.Builder
-					p := conn.readDataHead
-					str.WriteString("data:")
-					for p != nil {
-						fmt.Fprintf(&str, "%d, ", p.sn)
-						p = p.next
-					}
-					p = conn.readHead
-					str.WriteString("buff:")
-					for p != nil {
-						fmt.Fprintf(&str, "%d, ", p.sn)
-						p = p.next
-					}
-					fmt.Println(seg.a, "data segment", "sn", sn, "len", seg.n-dataSegmentPayload, "readSN", conn.readSN, "readLen", "queue", conn.readLen, str.String())
+					// var str strings.Builder
+					// p := conn.readDataHead
+					// str.WriteString("data:")
+					// for p != nil {
+					// 	fmt.Fprintf(&str, "%d, ", p.sn)
+					// 	p = p.next
+					// }
+					// p = conn.readHead
+					// str.WriteString("buff:")
+					// for p != nil {
+					// 	fmt.Fprintf(&str, "%d, ", p.sn)
+					// 	p = p.next
+					// }
+					// fmt.Println(seg.a, "data segment", "sn", sn, "len", seg.n-dataSegmentPayload, "readSN", conn.readSN, "readLen", "queue", conn.readLen, str.String())
 					// 通知可读
 					select {
 					case conn.readSignle <- 1:
@@ -628,7 +627,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					conn.remoteReadLen = binary.BigEndian.Uint16(seg.b[ackSegmentReadQueueLength:])
 				}
 				if ok {
-					fmt.Println(seg.a, "ack segment", "sn", sn, "max", maxSN, "ack", ackSN, "writeSN", conn.writeSN, "writeLen", conn.writeLen)
+					// fmt.Println(seg.a, "ack segment", "sn", sn, "max", maxSN, "ack", ackSN, "writeSN", conn.writeSN, "writeLen", conn.writeLen)
 					select {
 					case conn.writeSignle <- 1:
 					default:
