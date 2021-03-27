@@ -329,8 +329,9 @@ func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from byte, token uint32) 
 	conn.writeCap = connWriteQueue
 	conn.timer = time.NewTimer(0)
 	// test
-	conn.readSN = maxDataSN - 20
-	conn.writeSN = conn.readSN
+	conn.writeSN = maxDataSN - 5
+	conn.readSN = conn.writeSN
+	conn.testn = conn.readSN
 }
 
 // 从连接池中移除Conn
@@ -367,7 +368,7 @@ func (r *RUDP) removeConn(conn *Conn) {
 func (r *RUDP) handleUDPDataRoutine() {
 	defer func() {
 		r.waitGroup.Done()
-		fmt.Println("handleUDPDataRoutine exit")
+		// fmt.Println("handleUDPDataRoutine exit")
 	}()
 	var err error
 	var from byte
@@ -481,12 +482,35 @@ func (r *RUDP) handleUDPDataRoutine() {
 	}
 }
 
+// conn超时重传
+func (r *RUDP) connCheckRTORoutine(conn *Conn) {
+	defer func() {
+		conn.timer.Stop()
+		r.waitGroup.Done()
+		// fmt.Println("connCheckRTORoutine exit")
+	}()
+	conn.timer.Reset(conn.rto)
+	for !r.closed {
+		select {
+		case <-r.closeSignal: // RUDP关闭信号
+			return
+		case <-conn.stateSignal: // Conn关闭信号
+			return
+		case now := <-conn.timer.C: // 超时重传检查
+			conn.writeLock.Lock()
+			conn.checkRTO(now, r)
+			conn.writeLock.Unlock()
+			conn.timer.Reset(conn.rto)
+		}
+	}
+}
+
 // Conn处理消息和超时重发数据
 func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 	defer func() {
 		r.removeConn(conn)
 		r.waitGroup.Done()
-		fmt.Println("connHandleSegmentRoutine exit")
+		// fmt.Println("connHandleSegmentRoutine exit")
 	}()
 	for !r.closed {
 		select {
@@ -501,7 +525,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 			conn.readBytes += uint64(seg.n)
 			switch seg.b[0] {
 			case dialSegment:
-				fmt.Println(seg.a, "dial segment")
+				// fmt.Println(seg.a, "dial segment")
 				conn.lock.Lock()
 				switch conn.state {
 				case dialState:
@@ -539,7 +563,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					conn.lock.Unlock()
 				}
 			case acceptSegment:
-				fmt.Println(seg.a, "accept segment")
+				// fmt.Println(seg.a, "accept segment")
 				conn.lock.Lock()
 				switch conn.state {
 				case dialState:
@@ -564,7 +588,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				if conn.timestamp != timestamp {
 					break
 				}
-				fmt.Println(seg.a, "reject segment", "timestamp", timestamp)
+				// fmt.Println(seg.a, "reject segment", "timestamp", timestamp)
 				conn.lock.Lock()
 				switch conn.state {
 				case dialState:
@@ -588,21 +612,8 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				conn.readLock.Unlock()
 				// 响应ackSegment
 				r.WriteToConn(seg.b[:ackSegmentLength], conn)
+				fmt.Println(seg.a, "data segment", "sn", sn, "len", seg.n-dataSegmentPayload, "readSN", conn.readSN, "queue", conn.readQueueString())
 				if ok {
-					// var str strings.Builder
-					// p := conn.readDataHead
-					// str.WriteString("data:")
-					// for p != nil {
-					// 	fmt.Fprintf(&str, "%d, ", p.sn)
-					// 	p = p.next
-					// }
-					// p = conn.readHead
-					// str.WriteString("buff:")
-					// for p != nil {
-					// 	fmt.Fprintf(&str, "%d, ", p.sn)
-					// 	p = p.next
-					// }
-					// fmt.Println(seg.a, "data segment", "sn", sn, "len", seg.n-dataSegmentPayload, "readSN", conn.readSN, "readLen", "queue", conn.readLen, str.String())
 					// 通知可读
 					select {
 					case conn.readSignle <- 1:
@@ -626,19 +637,20 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					conn.readAckSN = ackSN
 					conn.remoteReadLen = binary.BigEndian.Uint16(seg.b[ackSegmentReadQueueLength:])
 				}
+				fmt.Println(seg.a, "ack segment", "sn", sn, "max", maxSN, "writeSN", conn.writeSN, "queue", conn.writeQueueString())
 				if ok {
-					// fmt.Println(seg.a, "ack segment", "sn", sn, "max", maxSN, "ack", ackSN, "writeSN", conn.writeSN, "writeLen", conn.writeLen)
 					select {
 					case conn.writeSignle <- 1:
 					default:
 					}
 				}
 			case closeSegment:
+				sn := uint24(seg.b[closeSegmentSN:])
 				timestamp := binary.BigEndian.Uint64(seg.b[closeSegmentTimestamp:])
-				if conn.timestamp != timestamp {
+				if conn.timestamp != timestamp || sn != conn.readSN {
 					break
 				}
-				fmt.Println(seg.a, "close segment")
+				// fmt.Println(seg.a, "close segment", "sn", sn)
 				conn.state |= shutdownState
 				seg.b[segmentType] = invalidSegment | conn.from
 				r.WriteTo(seg.b[:invalidSegmentLength], seg.a)
@@ -646,28 +658,6 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				return
 			}
 			segmentPool.Put(seg)
-		}
-	}
-}
-
-func (r *RUDP) connCheckRTORoutine(conn *Conn) {
-	defer func() {
-		conn.timer.Stop()
-		r.waitGroup.Done()
-		fmt.Println("connCheckRTORoutine exit")
-	}()
-	conn.timer.Reset(conn.rto)
-	for !r.closed {
-		select {
-		case <-r.closeSignal: // RUDP关闭信号
-			return
-		case <-conn.stateSignal: // Conn关闭信号
-			return
-		case now := <-conn.timer.C: // 超时重传检查
-			conn.writeLock.Lock()
-			conn.checkRTO(now, r)
-			conn.writeLock.Unlock()
-			conn.timer.Reset(conn.rto)
 		}
 	}
 }

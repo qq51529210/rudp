@@ -18,7 +18,7 @@ func Test_RUDP(t *testing.T) {
 	}
 	tr.WaitGroup.Add(2)
 	go tr.ServerRoutine()
-	go tr.ClientRoutine(100)
+	go tr.ClientRoutine(1024)
 	tr.Wait()
 	tr.server.Close()
 	tr.client.Close()
