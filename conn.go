@@ -2,10 +2,9 @@ package rudp
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
+	"math/big"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
@@ -26,11 +25,13 @@ const (
 var (
 	readDataPool    sync.Pool                 // readData pool
 	writeDataPool   sync.Pool                 // writeData pool
-	connWriteQueue  = uint16(128)             // 默认的conn的发送队列长度
-	connReadQueue   = uint16(128)             // 默认的conn的接收队列长度
-	connHandleQueue = uint16(256)             // 默认的conn的处理队列长度
+	connWriteQueue  = uint16(64)              // 默认的conn的发送队列长度
+	connReadQueue   = uint16(256)             // 默认的conn的接收队列长度
+	connHandleQueue = uint16(1024)            // 默认的conn的处理队列长度
 	connMinRTO      = 10 * time.Millisecond   // 最小超时重传，毫秒
 	connMaxRTO      = 1000 * time.Millisecond // 最大超时重传，毫秒
+	diffieHellmanP  = big.NewInt(0)           // Diffie-Hellman交换密钥算法的质数
+	diffieHellmanG  = big.NewInt(0)           // Diffie-Hellman交换密钥算法的质数
 )
 
 func init() {
@@ -40,6 +41,8 @@ func init() {
 	writeDataPool.New = func() interface{} {
 		return new(writeData)
 	}
+	diffieHellmanP.SetBytes([]byte("RUDP DIFFIE-HELLMAN KEY EXCHANGE"))
+	diffieHellmanG.SetBytes([]byte("rudp diffie-hellman key exchange"))
 }
 
 // 设置默认的conn的segment处理队列长度
@@ -120,7 +123,7 @@ type Conn struct {
 	minRTO             time.Duration // 最小rto，防止发送"过快"
 	maxRTO             time.Duration // 最大rto，防止发送"假死"
 	buff               [maxMSS]byte  // 发送dialSegment和closeSegment的缓存
-	testn              uint32
+	// testn              uint32
 }
 
 // net.Conn接口
@@ -461,14 +464,14 @@ func (c *Conn) read(b []byte) int {
 		// 数据块数据拷贝完了，移除
 		if c.dataHead.idx >= c.dataHead.len {
 			d := c.dataHead
-			fmt.Println("read sn", d.sn, "len", d.len, "readSN", c.readSN, "queue", c.readQueueString())
-			if d.sn != c.testn {
-				panic(fmt.Errorf("sn %d %d", d.sn, c.testn))
-			}
-			c.testn++
-			if c.testn > maxDataSN {
-				c.testn = 0
-			}
+			// fmt.Println("read sn", d.sn, "len", d.len, "readSN", c.readSN, "queue", c.readQueueString())
+			// if d.sn != c.testn {
+			// 	panic(fmt.Errorf("sn %d %d", d.sn, c.testn))
+			// }
+			// c.testn++
+			// if c.testn > maxDataSN {
+			// 	c.testn = 0
+			// }
 			c.dataHead = c.dataHead.next
 			c.readLen--
 			readDataPool.Put(d)
@@ -863,30 +866,31 @@ func (c *Conn) encAckSegment(seg *segment, sn uint32) {
 	c.writeAckSN++
 }
 
-func (c *Conn) readQueueString() string {
-	var str strings.Builder
-	p := c.dataHead
-	str.WriteString("data:")
-	for p != nil {
-		fmt.Fprintf(&str, "%d,", p.sn)
-		p = p.next
-	}
-	p = c.readHead
-	str.WriteString(" buff:")
-	for p != nil {
-		fmt.Fprintf(&str, "%d,", p.sn)
-		p = p.next
-	}
-	return str.String()
-}
-
-func (c *Conn) writeQueueString() string {
-	var str strings.Builder
-	p := c.writeHead
-	str.WriteString(" buff:")
-	for p != nil {
-		fmt.Fprintf(&str, "%d, ", p.sn)
-		p = p.next
-	}
-	return str.String()
-}
+//// test:打印接收队列
+// func (c *Conn) readQueueString() string {
+// 	var str strings.Builder
+// 	p := c.dataHead
+// 	str.WriteString("data:")
+// 	for p != nil {
+// 		fmt.Fprintf(&str, "%d,", p.sn)
+// 		p = p.next
+// 	}
+// 	p = c.readHead
+// 	str.WriteString(" buff:")
+// 	for p != nil {
+// 		fmt.Fprintf(&str, "%d,", p.sn)
+// 		p = p.next
+// 	}
+// 	return str.String()
+// }
+//// test:打印发送队列
+// func (c *Conn) writeQueueString() string {
+// 	var str strings.Builder
+// 	p := c.writeHead
+// 	str.WriteString(" buff:")
+// 	for p != nil {
+// 		fmt.Fprintf(&str, "%d, ", p.sn)
+// 		p = p.next
+// 	}
+// 	return str.String()
+// }

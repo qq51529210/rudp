@@ -47,7 +47,7 @@ const (
 	connectSegmentRemotePort = connectSegmentRemoteIP + 16  // remote internet port
 	connectSegmentMSS        = connectSegmentRemotePort + 2 // 探测的mss，用于对方调整接收队列
 	connectSegmentReadQueue  = connectSegmentMSS + 2        // 接收队列的空闲个数
-	connectSegmentLength     = connectSegmentReadQueue + 2  // 长度
+	connectSegmentLength     = connectSegmentReadQueue + 1  // 长度
 )
 
 const (

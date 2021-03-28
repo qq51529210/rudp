@@ -100,7 +100,7 @@ func (tr *testRUDP) ClientRoutine(multiple int) {
 	}
 	defer conn.Close()
 	// 写数据
-	conn.SetWriteBuffer(minMSS * 10)
+	// conn.SetWriteBuffer(minMSS * 10)
 	buff := make([]byte, 1024)
 	for i := 0; i < multiple; i++ {
 		mathRand.Read(buff)

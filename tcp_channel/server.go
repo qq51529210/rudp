@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -18,10 +19,13 @@ func runServer() {
 	if err != nil {
 		panic(err)
 	}
+	listener := tls.NewListener(server, &tls.Config{
+		InsecureSkipVerify: true,
+	})
 	// 监听
 	for {
 		// 等待新连接
-		conn, err := server.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println(err)
 			return

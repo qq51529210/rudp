@@ -329,9 +329,9 @@ func (r *RUDP) initConn(conn *Conn, addr *net.UDPAddr, from byte, token uint32) 
 	conn.writeCap = connWriteQueue
 	conn.timer = time.NewTimer(0)
 	// test
-	conn.writeSN = maxDataSN - 5
-	conn.readSN = conn.writeSN
-	conn.testn = conn.readSN
+	// conn.writeSN = maxDataSN - 5
+	// conn.readSN = conn.writeSN
+	// conn.testn = conn.readSN
 }
 
 // 从连接池中移除Conn
@@ -612,7 +612,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 				conn.readLock.Unlock()
 				// 响应ackSegment
 				r.WriteToConn(seg.b[:ackSegmentLength], conn)
-				fmt.Println(seg.a, "data segment", "sn", sn, "len", seg.n-dataSegmentPayload, "readSN", conn.readSN, "queue", conn.readQueueString())
+				// fmt.Println(seg.a, "data segment", "sn", sn, "len", seg.n-dataSegmentPayload, "readSN", conn.readSN, "queue", conn.readQueueString())
 				if ok {
 					// 通知可读
 					select {
@@ -637,7 +637,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 					conn.readAckSN = ackSN
 					conn.remoteReadLen = binary.BigEndian.Uint16(seg.b[ackSegmentReadQueueLength:])
 				}
-				fmt.Println(seg.a, "ack segment", "sn", sn, "max", maxSN, "writeSN", conn.writeSN, "queue", conn.writeQueueString())
+				// fmt.Println(seg.a, "ack segment", "sn", sn, "max", maxSN, "writeSN", conn.writeSN, "queue", conn.writeQueueString())
 				if ok {
 					select {
 					case conn.writeSignle <- 1:

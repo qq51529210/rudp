@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -40,12 +41,15 @@ func runClient() {
 				fmt.Println(err)
 				return
 			}
-			io.Copy(c2, c1)
+			tlsConn := tls.Client(c2, &tls.Config{
+				InsecureSkipVerify: true,
+			})
+			io.Copy(tlsConn, c1)
 			// proxy数据转发到client
 			go func(c1, c2 net.Conn) {
 				defer c2.Close()
 				io.Copy(c1, c2)
-			}(c1, c2)
+			}(c1, tlsConn)
 		}(conn)
 	}
 }
