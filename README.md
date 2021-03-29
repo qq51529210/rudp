@@ -5,4 +5,4 @@
 ## 用法 
 代码在[rudp_test.go](./rudp_test.go)中
 ## tcp_channel
-使用rudp实现的一个tcp转udp的代理程序 
+使用rudp实现的一个tcp转udp的代理程序，没有测试过，不过应该没有问题，因为rudp_test.go已经通过了。

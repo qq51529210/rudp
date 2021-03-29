@@ -2,8 +2,10 @@ package rudp
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -458,14 +460,7 @@ func (c *Conn) read(b []byte) int {
 		// 数据块数据拷贝完了，移除
 		if c.dataHead.idx >= c.dataHead.len {
 			d := c.dataHead
-			// fmt.Println("read sn", d.sn, "len", d.len, "readSN", c.readSN, "queue", c.readQueueString())
-			// if d.sn != c.testn {
-			// 	panic(fmt.Errorf("sn %d %d", d.sn, c.testn))
-			// }
-			// c.testn++
-			// if c.testn > maxDataSN {
-			// 	c.testn = 0
-			// }
+			// fmt.Println(c.localInternetAddr, "read sn", d.sn, "len", d.len, "readSN", c.readSN, "queue", c.readQueueString())
 			c.dataHead = c.dataHead.next
 			c.readLen--
 			readDataPool.Put(d)
@@ -860,31 +855,32 @@ func (c *Conn) encAckSegment(seg *segment, sn uint32) {
 	c.writeAckSN++
 }
 
-//// test:打印接收队列
-// func (c *Conn) readQueueString() string {
-// 	var str strings.Builder
-// 	p := c.dataHead
-// 	str.WriteString("data:")
-// 	for p != nil {
-// 		fmt.Fprintf(&str, "%d,", p.sn)
-// 		p = p.next
-// 	}
-// 	p = c.readHead
-// 	str.WriteString(" buff:")
-// 	for p != nil {
-// 		fmt.Fprintf(&str, "%d,", p.sn)
-// 		p = p.next
-// 	}
-// 	return str.String()
-// }
-//// test:打印发送队列
-// func (c *Conn) writeQueueString() string {
-// 	var str strings.Builder
-// 	p := c.writeHead
-// 	str.WriteString(" buff:")
-// 	for p != nil {
-// 		fmt.Fprintf(&str, "%d, ", p.sn)
-// 		p = p.next
-// 	}
-// 	return str.String()
-// }
+// test:打印接收队列
+func (c *Conn) readQueueString() string {
+	var str strings.Builder
+	p := c.dataHead
+	str.WriteString("data:")
+	for p != nil {
+		fmt.Fprintf(&str, "%d,", p.sn)
+		p = p.next
+	}
+	p = c.readHead
+	str.WriteString(" buff:")
+	for p != nil {
+		fmt.Fprintf(&str, "%d,", p.sn)
+		p = p.next
+	}
+	return str.String()
+}
+
+// test:打印发送队列
+func (c *Conn) writeQueueString() string {
+	var str strings.Builder
+	p := c.writeHead
+	str.WriteString(" buff:")
+	for p != nil {
+		fmt.Fprintf(&str, "%d, ", p.sn)
+		p = p.next
+	}
+	return str.String()
+}

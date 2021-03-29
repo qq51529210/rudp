@@ -3,9 +3,15 @@ package rudp
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"hash"
 	"io"
+	"math/big"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +24,7 @@ func Test_RUDP(t *testing.T) {
 	}
 	tr.WaitGroup.Add(2)
 	go tr.ServerRoutine()
-	go tr.ClientRoutine(1024)
+	go tr.ClientRoutine(10240)
 	tr.Wait()
 	tr.server.Close()
 	tr.client.Close()
@@ -66,8 +72,34 @@ func newTestRUDP() (*testRUDP, error) {
 
 func (tr *testRUDP) ServerRoutine() {
 	defer tr.WaitGroup.Done()
+	// tls
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		tr.serverError = err
+		return
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(time.Now().Unix())}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		tr.serverError = err
+		return
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		tr.serverError = err
+		return
+	}
 	// 连接
 	conn, err := tr.server.Accept()
+	if err != nil {
+		tr.serverError = err
+		return
+	}
+	tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
+	defer tlsConn.Close()
+	err = tlsConn.Handshake()
 	if err != nil {
 		tr.serverError = err
 		return
@@ -75,7 +107,7 @@ func (tr *testRUDP) ServerRoutine() {
 	// 读数据
 	buff := make([]byte, 1024)
 	for {
-		n, err := conn.Read(buff)
+		n, err := tlsConn.Read(buff)
 		if err != nil {
 			if err != io.EOF {
 				tr.serverError = err
@@ -98,13 +130,19 @@ func (tr *testRUDP) ClientRoutine(multiple int) {
 		tr.clientError = err
 		return
 	}
-	defer conn.Close()
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	defer tlsConn.Close()
+	err = tlsConn.Handshake()
+	if err != nil {
+		tr.clientError = err
+		return
+	}
 	// 写数据
 	// conn.SetWriteBuffer(minMSS * 10)
 	buff := make([]byte, 1024)
 	for i := 0; i < multiple; i++ {
 		mathRand.Read(buff)
-		n, err := conn.Write(buff)
+		n, err := tlsConn.Write(buff)
 		if err != nil {
 			tr.clientError = err
 			return

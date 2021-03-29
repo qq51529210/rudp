@@ -172,7 +172,7 @@ func (r *RUDP) Accept() (net.Conn, error) {
 	conn := r.acceptConn.Remove(r.acceptConn.Front()).(*Conn)
 	r.acceptCond.L.Unlock()
 	r.waitGroup.Add(1)
-	go r.connHandleSegmentRoutine(conn)
+	go r.connCheckRTORoutine(conn)
 	return conn, nil
 }
 
@@ -489,6 +489,7 @@ func (r *RUDP) connCheckRTORoutine(conn *Conn) {
 		r.waitGroup.Done()
 		// fmt.Println("connCheckRTORoutine exit")
 	}()
+	// fmt.Println(conn.LocalAddr(), "connCheckRTORoutine run")
 	conn.timer.Reset(conn.rto)
 	for !r.closed {
 		select {
@@ -512,6 +513,7 @@ func (r *RUDP) connHandleSegmentRoutine(conn *Conn) {
 		r.waitGroup.Done()
 		// fmt.Println("connHandleSegmentRoutine exit")
 	}()
+	// fmt.Println(conn.LocalAddr(), "connHandleSegmentRoutine run")
 	for !r.closed {
 		select {
 		case <-r.closeSignal: // RUDP关闭信号
