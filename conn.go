@@ -3,7 +3,6 @@ package rudp
 import (
 	"encoding/binary"
 	"io"
-	"math/big"
 	"net"
 	"sync"
 	"time"
@@ -30,8 +29,6 @@ var (
 	connHandleQueue = uint16(1024)            // 默认的conn的处理队列长度
 	connMinRTO      = 10 * time.Millisecond   // 最小超时重传，毫秒
 	connMaxRTO      = 1000 * time.Millisecond // 最大超时重传，毫秒
-	diffieHellmanP  = big.NewInt(0)           // Diffie-Hellman交换密钥算法的质数
-	diffieHellmanG  = big.NewInt(0)           // Diffie-Hellman交换密钥算法的质数
 )
 
 func init() {
@@ -41,8 +38,6 @@ func init() {
 	writeDataPool.New = func() interface{} {
 		return new(writeData)
 	}
-	diffieHellmanP.SetBytes([]byte("RUDP DIFFIE-HELLMAN KEY EXCHANGE"))
-	diffieHellmanG.SetBytes([]byte("rudp diffie-hellman key exchange"))
 }
 
 // 设置默认的conn的segment处理队列长度
@@ -123,7 +118,6 @@ type Conn struct {
 	minRTO             time.Duration // 最小rto，防止发送"过快"
 	maxRTO             time.Duration // 最大rto，防止发送"假死"
 	buff               [maxMSS]byte  // 发送dialSegment和closeSegment的缓存
-	// testn              uint32
 }
 
 // net.Conn接口
